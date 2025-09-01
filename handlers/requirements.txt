@@ -1,0 +1,6 @@
+aiogram>=3.3.0
+pyrogram
+tgcrypto
+aiohttp
+python-dotenv
+yt-dlp

@@ -10,18 +10,17 @@ from typing import List, Dict, Optional
 import aiohttp
 from aiogram import Bot, Router, F, types
 from aiogram.enums import ChatAction, ParseMode
-from aiogram.types import FSInputFile, InputMediaPhoto, Message, ReactionTypeEmoji
+from aiogram.types import (FSInputFile, InputMediaPhoto, Message,
+                           ReactionTypeEmoji, InlineKeyboardMarkup, InlineKeyboardButton)
 from pyrogram import Client as PyroClient
 from pyrogram.errors import FloodWait
 
 import config
 
-# --- Globals & Setup ---
 router = Router()
 chat_queues: Dict[int, asyncio.Queue] = {}
 active_workers: set[int] = set()
 download_semaphore = asyncio.Semaphore(4)
-
 
 # --- Helper Functions ---
 
@@ -36,7 +35,6 @@ async def extract_tweet_ids(text: str) -> Optional[List[str]]:
     استخراج جميع معرفات التغريدات الفريدة من النص، مع فك روابط t.co،
     والحفاظ على ترتيب ظهورها الأصلي في الرسالة.
     """
-    # Pattern to find full Twitter/X URLs OR t.co URLs in the order they appear
     url_pattern = r'https?://(?:(?:www\.)?(?:twitter|x)\.com/\S+/status/\d+|t\.co/\S+)'
     urls = re.findall(url_pattern, text)
     if not urls:
@@ -49,26 +47,21 @@ async def extract_tweet_ids(text: str) -> Optional[List[str]]:
         for url in urls:
             current_tweet_id = None
             
-            # If it's a t.co link, resolve it first
             if 't.co/' in url:
                 try:
-                    # Use HEAD request for efficiency, it follows redirects
                     async with session.head(url, allow_redirects=True) as response:
                         final_url = str(response.url)
-                        # Now extract the ID from the final, resolved URL
                         match = re.search(r'/status/(\d+)', final_url)
                         if match:
                             current_tweet_id = match.group(1)
                 except Exception as e:
                     print(f"Could not resolve t.co link {url}: {e}")
-                    continue # Skip to the next URL
+                    continue
             else:
-                # It's a direct Twitter/X link
                 match = re.search(r'/status/(\d+)', url)
                 if match:
                     current_tweet_id = match.group(1)
 
-            # Add the ID to our list if it's new and valid
             if current_tweet_id and current_tweet_id not in seen_ids:
                 ordered_unique_ids.append(current_tweet_id)
                 seen_ids.add(current_tweet_id)
@@ -94,7 +87,9 @@ async def ytdlp_download_tweet_video(tweet_id: str, out_dir: Path) -> Optional[P
         print(f"yt-dlp successfully downloaded video for tweet {tweet_id}")
         return output_path
     else:
-        print(f"yt-dlp failed for tweet {tweet_id}: {stderr.decode()}")
+        # Don't print error if it's just "no video found", it's expected behavior
+        if "No video could be found" not in stderr.decode():
+            print(f"yt-dlp failed for tweet {tweet_id}: {stderr.decode()}")
         return None
 
 async def scrape_media(tweet_id: str) -> Optional[dict]:
@@ -103,25 +98,11 @@ async def scrape_media(tweet_id: str) -> Optional[dict]:
     try:
         async with _get_session() as session, session.get(api_url) as response:
             if response.status == 200:
-                try:
-                    data = await response.json()
-                    if not data.get("media_extended"):
-                        print(f"No media found in vxtwitter API for {tweet_id}")
-                        return None
-                    return data
-                except aiohttp.ContentTypeError:
-                    error_html = await response.text()
-                    error_match = re.search(r'<meta property="og:description" content="([^"]+)">', error_html)
-                    if error_match:
-                        print(f"vxtwitter API error for {tweet_id}: {error_match.group(1)}")
-                    else:
-                        print(f"vxtwitter API returned non-JSON for {tweet_id}")
-                    return None
-            else:
-                print(f"vxtwitter API request failed for {tweet_id} with status: {response.status}")
-                return None
+                data = await response.json()
+                return data if data.get("media_extended") else None
+            return None
     except Exception as e:
-        print(f"Exception while scraping vxtwitter for {tweet_id}: {e}")
+        print(f"vxtwitter scrape failed for {tweet_id}: {e}")
         return None
 
 async def download_media(session: aiohttp.ClientSession, media_url: str, file_path: Path) -> bool:
@@ -133,33 +114,60 @@ async def download_media(session: aiohttp.ClientSession, media_url: str, file_pa
                     with open(file_path, "wb") as f:
                         async for chunk in response.content.iter_chunked(8192):
                             f.write(chunk)
-                    print(f"Successfully downloaded {file_path.name}")
                     return True
-                else:
-                    print(f"Failed to download {media_url}, status: {response.status}")
-                    return False
-        except Exception as e:
-            print(f"Exception during download of {media_url}: {e}")
-            return False
+        except Exception:
+            pass
+    return False
 
 
-async def send_large_file_pyro(file_path: Path, caption: Optional[str] = None):
+async def send_large_file_pyro(file_path: Path, caption: Optional[str] = None, parse_mode: str = "Markdown", markup: Optional[InlineKeyboardMarkup] = None):
     """إرسال الملفات الكبيرة إلى القناة المحددة باستخدام Pyrogram."""
-    print(f"File {file_path.name} is larger than 50MB. Uploading via Pyrogram...")
+    print(f"File > 50MB. Uploading via Pyrogram...")
     app = PyroClient("user_bot", api_id=config.API_ID, api_hash=config.API_HASH, session_string=config.PYRO_SESSION_STRING, in_memory=True)
     try:
         await app.start()
-        await app.send_video(chat_id=config.CHANNEL_ID, video=str(file_path), caption=caption)
+        # Pyrogram uses different parse mode enums, so we adapt
+        from pyrogram.enums import ParseMode as PyroParseMode
+        pyro_parse_mode = PyroParseMode.MARKDOWN if parse_mode and parse_mode.lower() == "markdown" else PyroParseMode.HTML
+
+        await app.send_video(
+            chat_id=config.CHANNEL_ID,
+            video=str(file_path),
+            caption=caption,
+            parse_mode=pyro_parse_mode,
+            reply_markup=markup
+        )
         await app.stop()
         print("Successfully uploaded large file to channel.")
     except FloodWait as e:
-        print(f"Pyrogram FloodWait: sleeping for {e.value} seconds.")
         await asyncio.sleep(e.value)
-        await send_large_file_pyro(file_path, caption)
+        await send_large_file_pyro(file_path, caption, parse_mode, markup)
     except Exception as e:
         print(f"Pyrogram failed to send file: {e}")
         if await app.is_connected:
             await app.stop()
+
+def format_caption(tweet_data: dict) -> str:
+    """تنسيق الكابشن الجديد"""
+    user_name = tweet_data.get("user_name", "Unknown")
+    user_screen_name = tweet_data.get("user_screen_name", "unknown")
+    
+    # Simple escape for markdown characters in names
+    user_name = user_name.replace('_', r'\_').replace('*', r'\*').replace('[', r'\[').replace('`', r'\`')
+
+    return f"🐦 **من حساب:** {user_name} (`@{user_screen_name}`)"
+
+
+def create_inline_keyboard(tweet_data: dict) -> InlineKeyboardMarkup:
+    """إنشاء أزرار تفاعلية"""
+    tweet_url = tweet_data.get("tweetURL", "")
+    if not tweet_url: return None
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 الرابط الأصلي", url=tweet_url)]
+    ])
+    return keyboard
+
 
 async def process_single_tweet(message: Message, tweet_id: str):
     """المعالجة الكاملة لتغريدة واحدة."""
@@ -168,72 +176,70 @@ async def process_single_tweet(message: Message, tweet_id: str):
     bot: Bot = message.bot
     
     try:
-        await bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-        
+        # 1. Try yt-dlp first for videos (best quality & protected tweets)
         video_path = await ytdlp_download_tweet_video(tweet_id, temp_dir)
         if video_path:
-            file_size = video_path.stat().st_size
-            caption = f"https://x.com/i/status/{tweet_id}"
-            if file_size > config.MAX_FILE_SIZE:
-                await send_large_file_pyro(video_path, caption)
-                await message.reply("✅ تم رفع الفيديو بنجاح إلى القناة لأنه أكبر من 50 ميغابايت.")
+            # yt-dlp doesn't give us user data, so we build a simple caption and keyboard
+            tweet_url = f"https://x.com/i/status/{tweet_id}"
+            caption = f"🐦 [تغريدة الفيديو]({tweet_url})"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔗 الرابط الأصلي", url=tweet_url)]])
+            
+            if video_path.stat().st_size > config.MAX_FILE_SIZE:
+                await send_large_file_pyro(video_path, caption, "Markdown", keyboard)
+                await message.reply("✅ تم رفع الفيديو بنجاح للقناة.", reply_markup=keyboard)
             else:
-                await message.reply_video(FSInputFile(video_path), caption=caption)
+                await message.reply_video(FSInputFile(video_path), caption=caption, parse_mode="Markdown", reply_markup=keyboard)
             return
 
+        # 2. Fallback to vxtwitter API for everything else
         tweet_data = await scrape_media(tweet_id)
-        if not tweet_data or not tweet_data.get("media_extended"):
+        if not tweet_data:
             await message.reply(f"لم أتمكن من العثور على وسائط للتغريدة:\nhttps://x.com/i/status/{tweet_id}")
             return
         
-        media_items = tweet_data["media_extended"]
+        caption = format_caption(tweet_data)
+        keyboard = create_inline_keyboard(tweet_data)
+
+        # Download all media
+        media_items = tweet_data.get("media_extended", [])
         photos, videos = [], []
-        
         async with _get_session() as session:
             tasks = []
             for item in media_items:
-                url = item.get("url")
-                if not url: continue
-                
-                file_name = Path(url).name.split('?')[0]
-                file_path = temp_dir / file_name
-                
-                if item["type"] == "image":
-                    photos.append({"path": file_path, "caption": tweet_data.get("text", "")})
-                elif item["type"] in ["video", "gif"]:
-                    videos.append({"path": file_path, "caption": f"https://x.com/i/status/{tweet_id}"})
-                tasks.append(download_media(session, url, file_path))
-
+                file_path = temp_dir / Path(item['url']).name.split('?')[0]
+                if item['type'] == 'image': photos.append(file_path)
+                elif item['type'] in ['video', 'gif']: videos.append(file_path)
+                tasks.append(download_media(session, item['url'], file_path))
             await asyncio.gather(*tasks)
 
-        photo_groups = [photos[i:i + 5] for i in range(0, len(photos), 5)]
-        for i, group in enumerate(photo_groups):
-            media_group = []
-            for j, photo in enumerate(group):
-                if not photo['path'].exists():
-                    continue
-                caption_to_set = photo["caption"] if i == 0 and j == 0 else None
-                media_group.append(
-                    InputMediaPhoto(media=FSInputFile(photo['path']), caption=caption_to_set, parse_mode=ParseMode.HTML)
-                )
-            if media_group:
-                await message.reply_media_group(media_group)
+        # Send Photos
+        if photos:
+            photo_groups = [photos[i:i + 5] for i in range(0, len(photos), 5)]
+            for i, group in enumerate(photo_groups):
+                media_group = [InputMediaPhoto(media=FSInputFile(p)) for p in group if p.exists()]
+                if not media_group: continue
+                # Add caption only to the first photo of the first group
+                if i == 0:
+                    media_group[0].caption = caption
+                    media_group[0].parse_mode = "Markdown"
+                sent_message = await message.reply_media_group(media_group)
+                # Add keyboard to the last message of the media group
+                if keyboard:
+                    await bot.edit_message_reply_markup(chat_id=sent_message[0].chat.id, message_id=sent_message[-1].message_id, reply_markup=keyboard)
+        
+        # Send Videos
+        for video_path in videos:
+            if not video_path.exists(): continue
 
-        for video in videos:
-            path = video["path"]
-            if not path.exists(): continue
-            
-            file_size = path.stat().st_size
-            if file_size > config.MAX_FILE_SIZE:
-                await send_large_file_pyro(path, video["caption"])
-                await message.reply("✅ تم رفع الفيديو بنجاح إلى القناة لأنه أكبر من 50 ميغابايت.")
+            if video_path.stat().st_size > config.MAX_FILE_SIZE:
+                await send_large_file_pyro(video_path, caption, "Markdown", keyboard)
+                await message.reply("✅ تم رفع الفيديو بنجاح للقناة.", reply_markup=keyboard)
             else:
-                await message.reply_video(FSInputFile(path), caption=video["caption"])
+                await message.reply_video(FSInputFile(video_path), caption=caption, parse_mode="Markdown", reply_markup=keyboard)
 
     finally:
         if temp_dir.exists():
             shutil.rmtree(temp_dir)
-            print(f"Cleaned up temporary directory: {temp_dir}")
 
 
 async def process_chat_queue(chat_id: int, bot: Bot):
@@ -244,41 +250,47 @@ async def process_chat_queue(chat_id: int, bot: Bot):
         return
 
     while not queue.empty():
-        message, tweet_ids = await queue.get()
+        message, tweet_ids, progress_msg = await queue.get()
         try:
-            for tweet_id in tweet_ids:
+            total = len(tweet_ids)
+            for i, tweet_id in enumerate(tweet_ids, 1):
                 try:
+                    await progress_msg.edit_text(f"⏳ جاري معالجة الرابط **{i}** من **{total}**...")
                     await process_single_tweet(message, tweet_id)
                 except Exception as e:
                     print(f"Unhandled error processing tweet {tweet_id} in chat {chat_id}: {e}")
-                    try:
-                        await bot.send_message(chat_id, f"حدث خطأ أثناء معالجة التغريدة: {tweet_id}")
-                        await bot.set_message_reaction(chat_id, message.message_id, reaction=[ReactionTypeEmoji(emoji='👎')])
-                    except Exception as reaction_err:
-                         print(f"Could not send error message or reaction: {reaction_err}")
+                    await bot.send_message(chat_id, f"حدث خطأ فادح أثناء معالجة التغريدة: {tweet_id}")
+            
+            await progress_msg.edit_text(f"✅ اكتملت معالجة **{total}** روابط!")
+            await asyncio.sleep(5)
+            await progress_msg.delete()
+        except Exception as e:
+            print(f"Fatal error in queue worker for chat {chat_id}: {e}")
+            await progress_msg.edit_text("❌ حدث خطأ غير متوقع أثناء المعالجة.")
         finally:
             queue.task_done()
 
     active_workers.discard(chat_id)
-    print(f"Worker for chat {chat_id} finished.")
 
 
 @router.message(F.text & (F.text.contains("twitter.com") | F.text.contains("x.com") | F.text.contains("t.co")))
 async def handle_twitter_links(message: types.Message, bot: Bot):
     """معالج الرسائل التي تحتوي على روابط X."""
-    chat_id = message.chat.id
     tweet_ids = await extract_tweet_ids(message.text)
     if not tweet_ids:
-        print("Handler triggered but no tweet IDs were extracted.")
         return
 
+    progress_msg = await message.reply(f"تم استلام **{len(tweet_ids)}** روابط. سيتم البدء في المعالجة...")
+    
+    chat_id = message.chat.id
     if chat_id not in chat_queues:
         chat_queues[chat_id] = asyncio.Queue()
-    await chat_queues[chat_id].put((message, tweet_ids))
+    await chat_queues[chat_id].put((message, tweet_ids, progress_msg))
+    
     try:
         await bot.set_message_reaction(chat_id, message.message_id, reaction=[ReactionTypeEmoji(emoji='👨‍💻')])
-    except Exception as e:
-        print(f"Couldn't set reaction: {e}")
+    except Exception:
+        pass
 
     if chat_id not in active_workers:
         active_workers.add(chat_id)

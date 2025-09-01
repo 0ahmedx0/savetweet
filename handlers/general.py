@@ -38,7 +38,7 @@ async def cmd_help(message: types.Message):
 @router.message(Command("settings"))
 async def cmd_settings(message: types.Message):
     """معالج أمر /settings (ميزة مستقبلية)"""
-    await message.reply("⚙️ قائمة الإعدادات ستكون متاحة قريبًا لتخصيص تجربتك!")```
+    await message.reply("⚙️ قائمة الإعدادات ستكون متاحة قريبًا لتخصيص تجربتك!")
 
 from aiogram import Router, types
 from aiogram.filters import Command

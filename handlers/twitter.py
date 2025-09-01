@@ -5,12 +5,13 @@ import re
 import shutil
 import uuid
 from pathlib import Path
-from typing import List, Dict, Optional, Coroutine
+from typing import List, Dict, Optional
 
 import aiohttp
 from aiogram import Bot, Router, F, types
-from aiogram.enums import ChatAction, ReactionType
-from aiogram.types import FSInputFile, InputMediaPhoto, Message
+from aiogram.enums import ChatAction
+# --- التعديل 1: تم تصحيح طريقة استيراد التفاعلات (Reactions) ---
+from aiogram.types import FSInputFile, InputMediaPhoto, Message, ReactionTypeEmoji
 from pyrogram import Client as PyroClient
 from pyrogram.errors import FloodWait
 
@@ -49,9 +50,6 @@ async def extract_tweet_ids(text: str) -> Optional[List[str]]:
         if match:  # Direct x.com/twitter.com link
             tweet_ids.add(match)
         else: # t.co link needs resolving
-            # Re-find the full t.co URL from the original text for this empty match
-            # This is a bit tricky but works for our regex
-            # Find all URLs and then filter for t.co
             all_urls = re.findall(r'https?://\S+', text)
             for url in all_urls:
                 if 't.co/' in url:
@@ -208,7 +206,7 @@ async def process_single_tweet(message: Message, tweet_id: str):
         
         # --- Download all media from vxtwitter API
         media_items = tweet_data["media_extended"]
-        photos, videos, downloaded_paths = [], [], []
+        photos, videos = [], []
         
         async with _get_session() as session:
             tasks = []
@@ -225,7 +223,6 @@ async def process_single_tweet(message: Message, tweet_id: str):
                     videos.append({"path": file_path, "caption": f"https://x.com/i/status/{tweet_id}"})
                 
                 tasks.append(download_media(session, url, file_path))
-                downloaded_paths.append(file_path)
 
             download_results = await asyncio.gather(*tasks)
             if not any(download_results):
@@ -282,7 +279,12 @@ async def process_chat_queue(chat_id: int, bot: Bot):
                 print(f"Unhandled error processing tweet {tweet_id} in chat {chat_id}: {e}")
                 try:
                     await bot.send_message(chat_id, f"حدث خطأ أثناء معالجة التغريدة: {tweet_id}")
-                    await bot.set_message_reaction(chat_id, message.message_id, [ReactionType(type='emoji', emoji='👎')])
+                    # --- التعديل 2: تم استخدام الطريقة الجديدة لوضع تفاعل عند الفشل ---
+                    await bot.set_message_reaction(
+                        chat_id,
+                        message.message_id,
+                        reaction=[ReactionTypeEmoji(emoji='👎')]
+                    )
                 except Exception as reaction_err:
                      print(f"Could not send error message or reaction: {reaction_err}")
             finally:
@@ -300,7 +302,6 @@ async def handle_twitter_links(message: types.Message, bot: Bot):
     
     tweet_ids = await extract_tweet_ids(message.text)
     if not tweet_ids:
-        # This should ideally not happen due to the filter, but as a safeguard.
         print("Handler triggered but no tweet IDs were extracted.")
         return
 
@@ -309,9 +310,15 @@ async def handle_twitter_links(message: types.Message, bot: Bot):
         chat_queues[chat_id] = asyncio.Queue()
     
     await chat_queues[chat_id].put((message, tweet_ids))
-    await bot.set_message_reaction(
-        chat_id, message.message_id, [ReactionType(type='emoji', emoji='👨‍💻')]
-    )
+    try:
+        # --- التعديل 3: تم استخدام الطريقة الجديدة لوضع تفاعل عند بدء المعالجة ---
+        await bot.set_message_reaction(
+            chat_id,
+            message.message_id,
+            reaction=[ReactionTypeEmoji(emoji='👨‍💻')]
+        )
+    except Exception as e:
+        print(f"Couldn't set reaction: {e}")
 
     # Start a worker for this chat if not already running
     if chat_id not in active_workers:

@@ -9,7 +9,6 @@ from typing import List, Dict, Optional
 
 import aiohttp
 from aiogram import Bot, Router, F, types
-# --- التعديل: استيراد ParseMode لاستخدامه مباشرة ---
 from aiogram.enums import ChatAction, ParseMode
 from aiogram.types import FSInputFile, InputMediaPhoto, Message, ReactionTypeEmoji
 from pyrogram import Client as PyroClient
@@ -196,25 +195,16 @@ async def process_single_tweet(message: Message, tweet_id: str):
 
             await asyncio.gather(*tasks)
 
-        # --- التعديل النهائي هنا ---
         photo_groups = [photos[i:i + 5] for i in range(0, len(photos), 5)]
         for i, group in enumerate(photo_groups):
             media_group = []
             for j, photo in enumerate(group):
                 if not photo['path'].exists():
                     continue
-                
                 caption_to_set = photo["caption"] if i == 0 and j == 0 else None
-                
-                # نستخدم ParseMode.HTML مباشرة لأننا نعرف أنه الوضع الافتراضي من main.py
                 media_group.append(
-                    InputMediaPhoto(
-                        media=FSInputFile(photo['path']),
-                        caption=caption_to_set,
-                        parse_mode=ParseMode.HTML
-                    )
+                    InputMediaPhoto(media=FSInputFile(photo['path']), caption=caption_to_set, parse_mode=ParseMode.HTML)
                 )
-            
             if media_group:
                 await message.reply_media_group(media_group)
 
@@ -244,18 +234,21 @@ async def process_chat_queue(chat_id: int, bot: Bot):
 
     while not queue.empty():
         message, tweet_ids = await queue.get()
-        for tweet_id in tweet_ids:
-            try:
-                await process_single_tweet(message, tweet_id)
-            except Exception as e:
-                print(f"Unhandled error processing tweet {tweet_id} in chat {chat_id}: {e}")
+        try:
+            for tweet_id in tweet_ids:
                 try:
-                    await bot.send_message(chat_id, f"حدث خطأ أثناء معالجة التغريدة: {tweet_id}")
-                    await bot.set_message_reaction(chat_id, message.message_id, reaction=[ReactionTypeEmoji(emoji='👎')])
-                except Exception as reaction_err:
-                     print(f"Could not send error message or reaction: {reaction_err}")
-            finally:
-                queue.task_done()
+                    await process_single_tweet(message, tweet_id)
+                except Exception as e:
+                    print(f"Unhandled error processing tweet {tweet_id} in chat {chat_id}: {e}")
+                    try:
+                        await bot.send_message(chat_id, f"حدث خطأ أثناء معالجة التغريدة: {tweet_id}")
+                        await bot.set_message_reaction(chat_id, message.message_id, reaction=[ReactionTypeEmoji(emoji='👎')])
+                    except Exception as reaction_err:
+                         print(f"Could not send error message or reaction: {reaction_err}")
+        finally:
+            # --- التعديل الوحيد هنا ---
+            # يتم استدعاء task_done() مرة واحدة فقط بعد الانتهاء من كل الروابط في الرسالة
+            queue.task_done()
 
     active_workers.discard(chat_id)
     print(f"Worker for chat {chat_id} finished.")

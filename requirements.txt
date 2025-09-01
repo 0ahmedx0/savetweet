@@ -4,3 +4,4 @@ tgcrypto
 aiohttp
 python-dotenv
 yt-dlp
+motor

@@ -32,37 +32,48 @@ def _get_session() -> aiohttp.ClientSession:
 
 
 async def extract_tweet_ids(text: str) -> Optional[List[str]]:
-    """استخراج جميع معرفات التغريدات الفريدة من النص، مع فك روابط t.co."""
-    url_pattern = r'https?://(?:www\.)?(?:twitter|x)\.com/\S+/status/(\d+)|https?://t\.co/\S+'
-    matches = re.findall(url_pattern, text)
-    if not matches:
+    """
+    استخراج جميع معرفات التغريدات الفريدة من النص، مع فك روابط t.co،
+    والحفاظ على ترتيب ظهورها الأصلي في الرسالة.
+    """
+    # Pattern to find full Twitter/X URLs OR t.co URLs in the order they appear
+    url_pattern = r'https?://(?:(?:www\.)?(?:twitter|x)\.com/\S+/status/\d+|t\.co/\S+)'
+    urls = re.findall(url_pattern, text)
+    if not urls:
         return None
 
-    tweet_ids = set()
-    unresolved_tco = []
+    ordered_unique_ids = []
+    seen_ids = set()
+    
+    async with _get_session() as session:
+        for url in urls:
+            current_tweet_id = None
+            
+            # If it's a t.co link, resolve it first
+            if 't.co/' in url:
+                try:
+                    # Use HEAD request for efficiency, it follows redirects
+                    async with session.head(url, allow_redirects=True) as response:
+                        final_url = str(response.url)
+                        # Now extract the ID from the final, resolved URL
+                        match = re.search(r'/status/(\d+)', final_url)
+                        if match:
+                            current_tweet_id = match.group(1)
+                except Exception as e:
+                    print(f"Could not resolve t.co link {url}: {e}")
+                    continue # Skip to the next URL
+            else:
+                # It's a direct Twitter/X link
+                match = re.search(r'/status/(\d+)', url)
+                if match:
+                    current_tweet_id = match.group(1)
 
-    for match in matches:
-        if match:
-            tweet_ids.add(match)
-        else:
-            all_urls = re.findall(r'https?://\S+', text)
-            for url in all_urls:
-                if 't.co/' in url:
-                    unresolved_tco.append(url)
+            # Add the ID to our list if it's new and valid
+            if current_tweet_id and current_tweet_id not in seen_ids:
+                ordered_unique_ids.append(current_tweet_id)
+                seen_ids.add(current_tweet_id)
 
-    if unresolved_tco:
-        async with _get_session() as session:
-            tasks = [session.head(url, allow_redirects=True) for url in set(unresolved_tco)]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-
-            for res in results:
-                if isinstance(res, aiohttp.ClientResponse):
-                    final_url = str(res.url)
-                    tweet_id_match = re.search(r'/status/(\d+)', final_url)
-                    if tweet_id_match:
-                        tweet_ids.add(tweet_id_match.group(1))
-
-    return list(tweet_ids) if tweet_ids else None
+    return ordered_unique_ids if ordered_unique_ids else None
 
 
 async def ytdlp_download_tweet_video(tweet_id: str, out_dir: Path) -> Optional[Path]:
@@ -246,8 +257,6 @@ async def process_chat_queue(chat_id: int, bot: Bot):
                     except Exception as reaction_err:
                          print(f"Could not send error message or reaction: {reaction_err}")
         finally:
-            # --- التعديل الوحيد هنا ---
-            # يتم استدعاء task_done() مرة واحدة فقط بعد الانتهاء من كل الروابط في الرسالة
             queue.task_done()
 
     active_workers.discard(chat_id)

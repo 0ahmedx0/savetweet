@@ -40,9 +40,6 @@ async def cmd_settings(message: types.Message):
     """معالج أمر /settings (ميزة مستقبلية)"""
     await message.reply("⚙️ قائمة الإعدادات ستكون متاحة قريبًا لتخصيص تجربتك!")```
 
-#### هـ. `handlers/admin.py` (جديد)
-```python
-# handlers/admin.py
 from aiogram import Router, types
 from aiogram.filters import Command
 from utils import AdminFilter

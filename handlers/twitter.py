@@ -9,7 +9,8 @@ from typing import List, Dict, Optional
 
 import aiohttp
 from aiogram import Bot, Router, F, types
-from aiogram.enums import ChatAction
+# --- التعديل: استيراد ParseMode لاستخدامه مباشرة ---
+from aiogram.enums import ChatAction, ParseMode
 from aiogram.types import FSInputFile, InputMediaPhoto, Message, ReactionTypeEmoji
 from pyrogram import Client as PyroClient
 from pyrogram.errors import FloodWait
@@ -195,10 +196,7 @@ async def process_single_tweet(message: Message, tweet_id: str):
 
             await asyncio.gather(*tasks)
 
-        # --- التعديل الرئيسي هنا: إصلاح خطأ parse_mode ---
-        # Get the bot's default parse mode to ensure consistency
-        bot_parse_mode = bot.default.parse_mode
-
+        # --- التعديل النهائي هنا ---
         photo_groups = [photos[i:i + 5] for i in range(0, len(photos), 5)]
         for i, group in enumerate(photo_groups):
             media_group = []
@@ -206,14 +204,14 @@ async def process_single_tweet(message: Message, tweet_id: str):
                 if not photo['path'].exists():
                     continue
                 
-                # The caption is only set on the very first photo of the very first group
                 caption_to_set = photo["caption"] if i == 0 and j == 0 else None
                 
+                # نستخدم ParseMode.HTML مباشرة لأننا نعرف أنه الوضع الافتراضي من main.py
                 media_group.append(
                     InputMediaPhoto(
                         media=FSInputFile(photo['path']),
                         caption=caption_to_set,
-                        parse_mode=bot_parse_mode  # Provide parse_mode on creation
+                        parse_mode=ParseMode.HTML
                     )
                 )
             

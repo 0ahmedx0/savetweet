@@ -9,7 +9,6 @@ from typing import List, Dict, Optional
 import aiohttp
 from aiogram import Bot, Router, F, types
 from aiogram.enums import ParseMode
-# <<< جديد: لاستيراد الأخطاء ومعالجتها
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (FSInputFile, InputMediaPhoto, Message,
                            ReactionTypeEmoji, InlineKeyboardMarkup, InlineKeyboardButton)
@@ -26,7 +25,7 @@ chat_queues: Dict[int, asyncio.Queue] = {}
 active_workers: set[int] = set()
 download_semaphore = asyncio.Semaphore(4)
 
-# --- Helper Functions (No changes here) ---
+# --- Helper Functions (No changes needed) ---
 def _get_session() -> aiohttp.ClientSession:
     timeout = aiohttp.ClientTimeout(total=45)
     return aiohttp.ClientSession(timeout=timeout)
@@ -71,7 +70,7 @@ async def scrape_media(tweet_id: str) -> Optional[dict]:
         async with _get_session() as session, session.get(api_url) as response:
             if response.status == 200:
                 data = await response.json()
-                return data if data.get("media_extended") else None
+                return data
             return None
     except Exception as e:
         print(f"vxtwitter scrape failed for {tweet_id}: {e}")
@@ -102,33 +101,21 @@ async def send_large_file_pyro(file_path: Path, caption: Optional[str] = None, p
         print(f"Pyrogram failed: {e}")
         if await app.is_connected: await app.stop()
 
-# --- Functions with Crucial Fixes ---
 
-def escape_markdown(text: str) -> str:
-    """Helper function to escape MarkdownV2 characters."""
-    # This is a simplified escape function for common characters.
-    escape_chars = r"_*[]()~`>#+-=|{}.!"
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+# --- Functions with NEW LOGIC ---
 
 def format_caption(tweet_data: dict) -> str:
     """
-    <<< تعديل 1: إصلاح جذري لمشكلة التنسيق >>>
+    <<< تعديل 1: الكابشن أصبح بسيطًا جدًا >>>
     """
-    user_name = escape_markdown(tweet_data.get("user_name", "Unknown"))
+    user_name = tweet_data.get("user_name", "Unknown").replace('_', r'\_').replace('*', r'\*').replace('[', r'\[').replace('`', r'\`')
     user_screen_name = tweet_data.get("user_screen_name", "unknown")
-    tweet_text = escape_markdown(tweet_data.get("text", "")) # الأهم: تحييد نص التغريدة
-    
-    if len(tweet_text) > 700:
-        tweet_text = tweet_text[:700] + "..."
-
-    # We are now using MarkdownV2 which requires escaping, but we'll tell Telegram it's "Markdown"
-    # for simplicity. Aiogram handles the conversion.
-    return (
-        f"🐦 **من حساب:** {user_name} (`@{user_screen_name}`)\n\n"
-        f"{tweet_text}"
-    )
+    return f"🐦 **بواسطة:** {user_name} (`@{user_screen_name}`)"
 
 def create_inline_keyboard(tweet_data: dict, user_msg_id: int) -> InlineKeyboardMarkup:
+    """
+    <<< تعديل 2: تم حذف زر 'إظهار النص' >>>
+    """
     tweet_url = tweet_data.get("tweetURL", "")
     tweet_id = tweet_data.get("id", "0")
     if not tweet_url: return None
@@ -138,30 +125,44 @@ def create_inline_keyboard(tweet_data: dict, user_msg_id: int) -> InlineKeyboard
     builder.adjust(2)
     return builder.as_markup()
 
+async def send_tweet_text_reply(original_message: Message, last_media_message: Message, tweet_data: dict):
+    """
+    <<< دالة جديدة 3: لإرسال نص التغريدة كرد على رسالة الوسائط >>>
+    """
+    tweet_text = tweet_data.get("text")
+    if tweet_text:
+        # أرسل النص كرد على آخر رسالة وسائط تم إرسالها
+        await last_media_message.reply(f"📝 **نص التغريدة:**\n\n{tweet_text}", parse_mode="Markdown", disable_web_page_preview=True)
+
 async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
     temp_dir = config.OUTPUT_DIR / str(uuid.uuid4())
     temp_dir.mkdir()
     bot: Bot = message.bot
+    last_sent_message: Optional[Message] = None # لتتبع آخر رسالة وسائط
     
     try:
         video_path = await ytdlp_download_tweet_video(tweet_id, temp_dir)
         if video_path:
             tweet_url = f"https://x.com/i/status/{tweet_id}"
-            caption = f"🐦 [تغريدة الفيديو]({tweet_url})" if settings.get("send_text") else ""
+            caption = f"🐦 [فيديو من تويتر]({tweet_url})"
             keyboard = create_inline_keyboard({"tweetURL": tweet_url, "id": tweet_id}, user_msg_id=message.message_id)
             if video_path.stat().st_size > config.MAX_FILE_SIZE:
                 await send_large_file_pyro(video_path, caption, "Markdown", keyboard)
-                await message.reply("✅ تم رفع الفيديو بنجاح للقناة.", reply_markup=keyboard)
+                last_sent_message = await message.reply("✅ تم رفع الفيديو بنجاح للقناة.", reply_markup=keyboard)
             else:
-                await message.reply_video(FSInputFile(video_path), caption=caption, parse_mode="Markdown", reply_markup=keyboard)
+                last_sent_message = await message.reply_video(FSInputFile(video_path), caption=caption, parse_mode="Markdown", reply_markup=keyboard)
+            
+            # Since yt-dlp doesn't fetch text, we don't send a separate text message.
+            # The context is in the caption.
             return
 
         tweet_data = await scrape_media(tweet_id)
-        if not tweet_data:
+        # We check for media_extended as a fallback. `scrape_media` should already do this, but this is safer.
+        if not tweet_data or not tweet_data.get("media_extended"):
             await message.reply(f"لم أتمكن من العثور على وسائط للتغريدة:\nhttps://x.com/i/status/{tweet_id}")
             return
         
-        caption = format_caption(tweet_data) if settings.get("send_text") else ""
+        caption = format_caption(tweet_data)
         keyboard = create_inline_keyboard(tweet_data, user_msg_id=message.message_id)
 
         media_items, photos, videos = tweet_data.get("media_extended", []), [], []
@@ -178,27 +179,27 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
         if photos:
             photo_groups = [photos[i:i + 5] for i in range(0, len(photos), 5)]
             for i, group in enumerate(photo_groups):
-                media_group = []
-                for j, photo_path in enumerate(group):
-                    current_caption = caption if i == 0 and j == 0 else None
-                    media_group.append(InputMediaPhoto(media=FSInputFile(photo_path), caption=current_caption, parse_mode="Markdown"))
+                media_group = [InputMediaPhoto(media=FSInputFile(p), caption=caption if i == 0 and j == 0 else None, parse_mode="Markdown") for j, p in enumerate(group)]
                 if not media_group: continue
-                sent_message = await message.reply_media_group(media_group)
-                if keyboard:
-                    try: await bot.edit_message_reply_markup(chat_id=sent_message[0].chat.id, message_id=sent_message[-1].message_id, reply_markup=keyboard)
-                    except TelegramBadRequest: pass # Ignore if markup is already the same
+                sent_messages = await message.reply_media_group(media_group)
+                last_sent_message = sent_messages[-1]
+                if keyboard: await bot.edit_message_reply_markup(chat_id=last_sent_message.chat.id, message_id=last_sent_message.message_id, reply_markup=keyboard)
         
         for video_path in videos:
             if video_path.stat().st_size > config.MAX_FILE_SIZE:
                 await send_large_file_pyro(video_path, caption, "Markdown", keyboard)
-                await message.reply("✅ تم رفع الفيديو بنجاح للقناة.", reply_markup=keyboard)
+                last_sent_message = await message.reply("✅ تم رفع الفيديو بنجاح للقناة.", reply_markup=keyboard)
             else:
-                await message.reply_video(FSInputFile(video_path), caption=caption, parse_mode="Markdown", reply_markup=keyboard)
+                last_sent_message = await message.reply_video(FSInputFile(video_path), caption=caption, parse_mode="Markdown", reply_markup=keyboard)
+
+        # <<< تعديل 4: إرسال النص بعد إرسال كل الوسائط >>>
+        if last_sent_message and settings.get("send_text"):
+            await send_tweet_text_reply(message, last_sent_message, tweet_data)
+
     finally:
         if temp_dir.exists(): shutil.rmtree(temp_dir)
 
-# --- Queue and Handler Logic with Fixes ---
-
+# Queue and Handler Logic (No changes here)
 async def process_chat_queue(chat_id: int, bot: Bot):
     queue = chat_queues.get(chat_id)
     if not queue: active_workers.discard(chat_id); return
@@ -209,12 +210,10 @@ async def process_chat_queue(chat_id: int, bot: Bot):
             total = len(tweet_ids)
             for i, tweet_id in enumerate(tweet_ids, 1):
                 try:
-                    # <<< تعديل 2: تجاهل أخطاء "message not modified"
                     try:
                         await progress_msg.edit_text(f"⏳ جاري معالجة الرابط **{i}** من **{total}**...", parse_mode="Markdown")
                     except TelegramBadRequest as e:
-                        if "message is not modified" not in e.message:
-                            raise # Re-raise other bad requests
+                        if "message is not modified" not in e.message: raise
                     await process_single_tweet(message, tweet_id, settings)
                 except Exception as e: print(f"Error processing tweet {tweet_id}: {e}")
             await progress_msg.edit_text(f"✅ اكتملت معالجة **{total}** روابط!", parse_mode="Markdown")
@@ -240,10 +239,15 @@ async def handle_twitter_links(message: types.Message, bot: Bot):
         active_workers.add(chat_id)
         asyncio.create_task(process_chat_queue(chat_id, bot))
 
+# <<< تعديل 5: تم حذف معالج زر 'إظهار النص' نهائياً >>>
 @router.callback_query(TweetActionCallback.filter(F.action == "delete"))
 async def handle_delete_media(callback: types.CallbackQuery, callback_data: TweetActionCallback):
-    try: await callback.message.delete()
+    try: await callback.message.delete() # Delete media message
     except Exception: pass
-    try: await callback.bot.delete_message(chat_id=callback.message.chat.id, message_id=callback_data.user_msg_id)
+    try: # Delete the text reply if it exists
+        if callback.message.reply_to_message: await callback.message.reply_to_message.delete()
+    except Exception: pass
+    try: # Delete the original user message with the link
+        await callback.bot.delete_message(chat_id=callback.message.chat.id, message_id=callback_data.user_msg_id)
     except Exception: pass
     await callback.answer("تم الحذف.")

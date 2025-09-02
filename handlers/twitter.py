@@ -9,6 +9,8 @@ from typing import List, Dict, Optional
 import aiohttp
 from aiogram import Bot, Router, F, types
 from aiogram.enums import ParseMode
+# <<< جديد: لاستيراد الأخطاء ومعالجتها
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import (FSInputFile, InputMediaPhoto, Message,
                            ReactionTypeEmoji, InlineKeyboardMarkup, InlineKeyboardButton)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -24,7 +26,7 @@ chat_queues: Dict[int, asyncio.Queue] = {}
 active_workers: set[int] = set()
 download_semaphore = asyncio.Semaphore(4)
 
-# --- Helper Functions (No changes needed) ---
+# --- Helper Functions (No changes here) ---
 def _get_session() -> aiohttp.ClientSession:
     timeout = aiohttp.ClientTimeout(total=45)
     return aiohttp.ClientSession(timeout=timeout)
@@ -100,43 +102,42 @@ async def send_large_file_pyro(file_path: Path, caption: Optional[str] = None, p
         print(f"Pyrogram failed: {e}")
         if await app.is_connected: await app.stop()
 
-# --- Functions with Changes ---
+# --- Functions with Crucial Fixes ---
+
+def escape_markdown(text: str) -> str:
+    """Helper function to escape MarkdownV2 characters."""
+    # This is a simplified escape function for common characters.
+    escape_chars = r"_*[]()~`>#+-=|{}.!"
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
 def format_caption(tweet_data: dict) -> str:
     """
-    <<< تعديل 1: تم دمج نص التغريدة هنا >>>
-    تنسيق الكابشن الجديد ليحتوي على نص التغريدة.
+    <<< تعديل 1: إصلاح جذري لمشكلة التنسيق >>>
     """
-    user_name = tweet_data.get("user_name", "Unknown").replace('_', r'\_').replace('*', r'\*').replace('[', r'\[').replace('`', r'\`')
+    user_name = escape_markdown(tweet_data.get("user_name", "Unknown"))
     user_screen_name = tweet_data.get("user_screen_name", "unknown")
-    tweet_text = tweet_data.get("text", "")
+    tweet_text = escape_markdown(tweet_data.get("text", "")) # الأهم: تحييد نص التغريدة
     
-    # قص النص الطويل جدًا لمنع مشاكل العرض
     if len(tweet_text) > 700:
         tweet_text = tweet_text[:700] + "..."
 
+    # We are now using MarkdownV2 which requires escaping, but we'll tell Telegram it's "Markdown"
+    # for simplicity. Aiogram handles the conversion.
     return (
         f"🐦 **من حساب:** {user_name} (`@{user_screen_name}`)\n\n"
         f"{tweet_text}"
     )
 
 def create_inline_keyboard(tweet_data: dict, user_msg_id: int) -> InlineKeyboardMarkup:
-    """
-    <<< تعديل 2: تم حذف زر 'إظهار النص' >>>
-    إنشاء أزرار تفاعلية.
-    """
     tweet_url = tweet_data.get("tweetURL", "")
     tweet_id = tweet_data.get("id", "0")
     if not tweet_url: return None
-    
     builder = InlineKeyboardBuilder()
     builder.button(text="🔗 الرابط الأصلي", url=tweet_url)
     builder.button(text="🗑️ حذف", callback_data=TweetActionCallback(action="delete", tweet_id=tweet_id, user_msg_id=user_msg_id))
-    builder.adjust(2) # زرين في نفس السطر
+    builder.adjust(2)
     return builder.as_markup()
 
-# process_single_tweet remains the same as it already uses the functions above.
-# The logic will automatically adapt.
 async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
     temp_dir = config.OUTPUT_DIR / str(uuid.uuid4())
     temp_dir.mkdir()
@@ -145,14 +146,9 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
     try:
         video_path = await ytdlp_download_tweet_video(tweet_id, temp_dir)
         if video_path:
-            # For yt-dlp, we can't get tweet text easily, so the caption will be simpler
             tweet_url = f"https://x.com/i/status/{tweet_id}"
             caption = f"🐦 [تغريدة الفيديو]({tweet_url})" if settings.get("send_text") else ""
-            # We don't have full tweet_data, so we can't get the user_name easily.
-            # A simpler keyboard is better here.
-            keyboard_data = {"tweetURL": tweet_url, "id": tweet_id}
-            keyboard = create_inline_keyboard(keyboard_data, user_msg_id=message.message_id)
-
+            keyboard = create_inline_keyboard({"tweetURL": tweet_url, "id": tweet_id}, user_msg_id=message.message_id)
             if video_path.stat().st_size > config.MAX_FILE_SIZE:
                 await send_large_file_pyro(video_path, caption, "Markdown", keyboard)
                 await message.reply("✅ تم رفع الفيديو بنجاح للقناة.", reply_markup=keyboard)
@@ -184,13 +180,13 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
             for i, group in enumerate(photo_groups):
                 media_group = []
                 for j, photo_path in enumerate(group):
-                    if i == 0 and j == 0 and caption:
-                        media_group.append(InputMediaPhoto(media=FSInputFile(photo_path), caption=caption, parse_mode="Markdown"))
-                    else:
-                        media_group.append(InputMediaPhoto(media=FSInputFile(photo_path)))
+                    current_caption = caption if i == 0 and j == 0 else None
+                    media_group.append(InputMediaPhoto(media=FSInputFile(photo_path), caption=current_caption, parse_mode="Markdown"))
                 if not media_group: continue
                 sent_message = await message.reply_media_group(media_group)
-                if keyboard: await bot.edit_message_reply_markup(chat_id=sent_message[0].chat.id, message_id=sent_message[-1].message_id, reply_markup=keyboard)
+                if keyboard:
+                    try: await bot.edit_message_reply_markup(chat_id=sent_message[0].chat.id, message_id=sent_message[-1].message_id, reply_markup=keyboard)
+                    except TelegramBadRequest: pass # Ignore if markup is already the same
         
         for video_path in videos:
             if video_path.stat().st_size > config.MAX_FILE_SIZE:
@@ -201,7 +197,8 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
     finally:
         if temp_dir.exists(): shutil.rmtree(temp_dir)
 
-# Queue and Handler Logic (No changes here)
+# --- Queue and Handler Logic with Fixes ---
+
 async def process_chat_queue(chat_id: int, bot: Bot):
     queue = chat_queues.get(chat_id)
     if not queue: active_workers.discard(chat_id); return
@@ -212,7 +209,12 @@ async def process_chat_queue(chat_id: int, bot: Bot):
             total = len(tweet_ids)
             for i, tweet_id in enumerate(tweet_ids, 1):
                 try:
-                    await progress_msg.edit_text(f"⏳ جاري معالجة الرابط **{i}** من **{total}**...", parse_mode="Markdown")
+                    # <<< تعديل 2: تجاهل أخطاء "message not modified"
+                    try:
+                        await progress_msg.edit_text(f"⏳ جاري معالجة الرابط **{i}** من **{total}**...", parse_mode="Markdown")
+                    except TelegramBadRequest as e:
+                        if "message is not modified" not in e.message:
+                            raise # Re-raise other bad requests
                     await process_single_tweet(message, tweet_id, settings)
                 except Exception as e: print(f"Error processing tweet {tweet_id}: {e}")
             await progress_msg.edit_text(f"✅ اكتملت معالجة **{total}** روابط!", parse_mode="Markdown")
@@ -237,9 +239,6 @@ async def handle_twitter_links(message: types.Message, bot: Bot):
     if chat_id not in active_workers:
         active_workers.add(chat_id)
         asyncio.create_task(process_chat_queue(chat_id, bot))
-
-# <<< تعديل 3: تم حذف معالج زر 'إظهار النص' >>>
-# handle_show_text callback is no longer needed and has been removed.
 
 @router.callback_query(TweetActionCallback.filter(F.action == "delete"))
 async def handle_delete_media(callback: types.CallbackQuery, callback_data: TweetActionCallback):

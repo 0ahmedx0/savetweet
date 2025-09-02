@@ -25,7 +25,7 @@ chat_queues: Dict[int, asyncio.Queue] = {}
 active_workers: set[int] = set()
 download_semaphore = asyncio.Semaphore(4)
 
-# --- Helper Functions (No changes needed) ---
+# --- Helper Functions (No changes here) ---
 def _get_session() -> aiohttp.ClientSession:
     timeout = aiohttp.ClientTimeout(total=45)
     return aiohttp.ClientSession(timeout=timeout)
@@ -68,9 +68,7 @@ async def scrape_media(tweet_id: str) -> Optional[dict]:
     api_url = f"https://api.vxtwitter.com/i/status/{tweet_id}"
     try:
         async with _get_session() as session, session.get(api_url) as response:
-            if response.status == 200:
-                data = await response.json()
-                return data
+            if response.status == 200: return await response.json()
             return None
     except Exception as e:
         print(f"vxtwitter scrape failed for {tweet_id}: {e}")
@@ -102,20 +100,20 @@ async def send_large_file_pyro(file_path: Path, caption: Optional[str] = None, p
         if await app.is_connected: await app.stop()
 
 
-# --- Functions with NEW LOGIC ---
+# --- Functions with CRUCIAL FIX ---
+def escape_markdown(text: str) -> str:
+    """
+    <<< الإصلاح الحاسم هنا: إعادة دالة تهريب الرموز >>>
+    """
+    escape_chars = r"_*[]()~`>#+-=|{}.!"
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
 def format_caption(tweet_data: dict) -> str:
-    """
-    <<< تعديل 1: الكابشن أصبح بسيطًا جدًا >>>
-    """
-    user_name = tweet_data.get("user_name", "Unknown").replace('_', r'\_').replace('*', r'\*').replace('[', r'\[').replace('`', r'\`')
+    user_name = escape_markdown(tweet_data.get("user_name", "Unknown"))
     user_screen_name = tweet_data.get("user_screen_name", "unknown")
     return f"🐦 **بواسطة:** {user_name} (`@{user_screen_name}`)"
 
 def create_inline_keyboard(tweet_data: dict, user_msg_id: int) -> InlineKeyboardMarkup:
-    """
-    <<< تعديل 2: تم حذف زر 'إظهار النص' >>>
-    """
     tweet_url = tweet_data.get("tweetURL", "")
     tweet_id = tweet_data.get("id", "0")
     if not tweet_url: return None
@@ -126,19 +124,17 @@ def create_inline_keyboard(tweet_data: dict, user_msg_id: int) -> InlineKeyboard
     return builder.as_markup()
 
 async def send_tweet_text_reply(original_message: Message, last_media_message: Message, tweet_data: dict):
-    """
-    <<< دالة جديدة 3: لإرسال نص التغريدة كرد على رسالة الوسائط >>>
-    """
     tweet_text = tweet_data.get("text")
     if tweet_text:
-        # أرسل النص كرد على آخر رسالة وسائط تم إرسالها
-        await last_media_message.reply(f"📝 **نص التغريدة:**\n\n{tweet_text}", parse_mode="Markdown", disable_web_page_preview=True)
+        # <<< تطبيق الإصلاح هنا قبل الإرسال >>>
+        safe_text = escape_markdown(tweet_text)
+        await last_media_message.reply(f"📝 **نص التغريدة:**\n\n{safe_text}", parse_mode="Markdown", disable_web_page_preview=True)
 
 async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
     temp_dir = config.OUTPUT_DIR / str(uuid.uuid4())
     temp_dir.mkdir()
     bot: Bot = message.bot
-    last_sent_message: Optional[Message] = None # لتتبع آخر رسالة وسائط
+    last_sent_message: Optional[Message] = None
     
     try:
         video_path = await ytdlp_download_tweet_video(tweet_id, temp_dir)
@@ -152,12 +148,13 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
             else:
                 last_sent_message = await message.reply_video(FSInputFile(video_path), caption=caption, parse_mode="Markdown", reply_markup=keyboard)
             
-            # Since yt-dlp doesn't fetch text, we don't send a separate text message.
-            # The context is in the caption.
+            # Since yt-dlp doesn't reliably fetch text, we will fetch it now if needed.
+            if settings.get("send_text"):
+                tweet_data = await scrape_media(tweet_id)
+                if tweet_data: await send_tweet_text_reply(message, last_sent_message, tweet_data)
             return
 
         tweet_data = await scrape_media(tweet_id)
-        # We check for media_extended as a fallback. `scrape_media` should already do this, but this is safer.
         if not tweet_data or not tweet_data.get("media_extended"):
             await message.reply(f"لم أتمكن من العثور على وسائط للتغريدة:\nhttps://x.com/i/status/{tweet_id}")
             return
@@ -192,14 +189,13 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
             else:
                 last_sent_message = await message.reply_video(FSInputFile(video_path), caption=caption, parse_mode="Markdown", reply_markup=keyboard)
 
-        # <<< تعديل 4: إرسال النص بعد إرسال كل الوسائط >>>
         if last_sent_message and settings.get("send_text"):
             await send_tweet_text_reply(message, last_sent_message, tweet_data)
 
     finally:
         if temp_dir.exists(): shutil.rmtree(temp_dir)
 
-# Queue and Handler Logic (No changes here)
+# --- Queue and Handler Logic with Fixes ---
 async def process_chat_queue(chat_id: int, bot: Bot):
     queue = chat_queues.get(chat_id)
     if not queue: active_workers.discard(chat_id); return
@@ -239,15 +235,14 @@ async def handle_twitter_links(message: types.Message, bot: Bot):
         active_workers.add(chat_id)
         asyncio.create_task(process_chat_queue(chat_id, bot))
 
-# <<< تعديل 5: تم حذف معالج زر 'إظهار النص' نهائياً >>>
 @router.callback_query(TweetActionCallback.filter(F.action == "delete"))
 async def handle_delete_media(callback: types.CallbackQuery, callback_data: TweetActionCallback):
-    try: await callback.message.delete() # Delete media message
+    try: await callback.message.delete()
     except Exception: pass
-    try: # Delete the text reply if it exists
+    try: 
         if callback.message.reply_to_message: await callback.message.reply_to_message.delete()
     except Exception: pass
-    try: # Delete the original user message with the link
+    try: 
         await callback.bot.delete_message(chat_id=callback.message.chat.id, message_id=callback_data.user_msg_id)
     except Exception: pass
     await callback.answer("تم الحذف.")

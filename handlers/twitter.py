@@ -24,7 +24,7 @@ chat_queues: Dict[int, asyncio.Queue] = {}
 active_workers: set[int] = set()
 download_semaphore = asyncio.Semaphore(4)
 
-# --- Helper Functions (No changes needed here, full code included for completeness) ---
+# --- Helper Functions (No changes needed here) ---
 
 def _get_session() -> aiohttp.ClientSession:
     timeout = aiohttp.ClientTimeout(total=45)
@@ -60,10 +60,8 @@ async def ytdlp_download_tweet_video(tweet_id: str, out_dir: Path) -> Optional[P
     if config.X_COOKIES: cmd.extend(['--cookies', str(config.X_COOKIES)])
     process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     stdout, stderr = await process.communicate()
-    if process.returncode == 0 and output_path.exists():
-        return output_path
-    if "No video could be found" not in stderr.decode():
-        print(f"yt-dlp failed for tweet {tweet_id}: {stderr.decode()}")
+    if process.returncode == 0 and output_path.exists(): return output_path
+    if "No video could be found" not in stderr.decode(): print(f"yt-dlp failed for tweet {tweet_id}: {stderr.decode()}")
     return None
 
 async def scrape_media(tweet_id: str) -> Optional[dict]:
@@ -90,7 +88,6 @@ async def download_media(session: aiohttp.ClientSession, media_url: str, file_pa
     return False
 
 async def send_large_file_pyro(file_path: Path, caption: Optional[str] = None, parse_mode: str = "Markdown", markup: Optional[InlineKeyboardMarkup] = None):
-    print(f"File > 50MB. Uploading via Pyrogram...")
     app = PyroClient("user_bot", api_id=config.API_ID, api_hash=config.API_HASH, session_string=config.PYRO_SESSION_STRING, in_memory=True)
     try:
         await app.start()
@@ -99,8 +96,7 @@ async def send_large_file_pyro(file_path: Path, caption: Optional[str] = None, p
         await app.send_video(config.CHANNEL_ID, str(file_path), caption=caption, parse_mode=pyro_parse_mode, reply_markup=markup)
         await app.stop()
     except FloodWait as e:
-        await asyncio.sleep(e.value)
-        await send_large_file_pyro(file_path, caption, parse_mode, markup)
+        await asyncio.sleep(e.value); await send_large_file_pyro(file_path, caption, parse_mode, markup)
     except Exception as e:
         print(f"Pyrogram failed: {e}")
         if await app.is_connected: await app.stop()
@@ -132,9 +128,8 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
         video_path = await ytdlp_download_tweet_video(tweet_id, temp_dir)
         if video_path:
             tweet_url = f"https://x.com/i/status/{tweet_id}"
-            caption = f"🐦 [تغريدة الفيديو]({tweet_url})"
-            keyboard_data = {"tweetURL": tweet_url, "id": tweet_id}
-            keyboard = create_inline_keyboard(keyboard_data, user_msg_id=message.message_id)
+            caption = f"🐦 [تغريدة الفيديو]({tweet_url})" if settings.get("send_text") else ""
+            keyboard = create_inline_keyboard({"tweetURL": tweet_url, "id": tweet_id}, user_msg_id=message.message_id)
             if video_path.stat().st_size > config.MAX_FILE_SIZE:
                 await send_large_file_pyro(video_path, caption, "Markdown", keyboard)
                 await message.reply("✅ تم رفع الفيديو بنجاح للقناة.", reply_markup=keyboard)
@@ -150,26 +145,30 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
         caption = format_caption(tweet_data) if settings.get("send_text") else ""
         keyboard = create_inline_keyboard(tweet_data, user_msg_id=message.message_id)
 
-        media_items = tweet_data.get("media_extended", [])
-        photos, videos = [], []
+        media_items, photos, videos = tweet_data.get("media_extended", []), [], []
         async with _get_session() as session:
             tasks = [download_media(session, item['url'], temp_dir / Path(item['url']).name.split('?')[0]) for item in media_items]
             await asyncio.gather(*tasks)
 
         for item in media_items:
             path = temp_dir / Path(item['url']).name.split('?')[0]
-            if not path.exists(): continue
-            if item['type'] == 'image': photos.append(path)
-            elif item['type'] in ['video', 'gif']: videos.append(path)
+            if path.exists():
+                if item['type'] == 'image': photos.append(path)
+                elif item['type'] in ['video', 'gif']: videos.append(path)
 
+        # --- التصحيح النهائي لمشكلة parse_mode ---
         if photos:
             photo_groups = [photos[i:i + 5] for i in range(0, len(photos), 5)]
             for i, group in enumerate(photo_groups):
-                media_group = [InputMediaPhoto(media=FSInputFile(p)) for p in group]
+                media_group = []
+                for j, photo_path in enumerate(group):
+                    # يتم إضافة الكابشن فقط في الصورة الأولى من أول ألبوم
+                    if i == 0 and j == 0 and caption:
+                        media_group.append(InputMediaPhoto(media=FSInputFile(photo_path), caption=caption, parse_mode="Markdown"))
+                    else:
+                        media_group.append(InputMediaPhoto(media=FSInputFile(photo_path)))
+                
                 if not media_group: continue
-                if i == 0 and caption:
-                    media_group[0].caption = caption
-                    media_group[0].parse_mode = "Markdown"
                 sent_message = await message.reply_media_group(media_group)
                 if keyboard: await bot.edit_message_reply_markup(chat_id=sent_message[0].chat.id, message_id=sent_message[-1].message_id, reply_markup=keyboard)
         
@@ -187,7 +186,6 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
 async def process_chat_queue(chat_id: int, bot: Bot):
     queue = chat_queues.get(chat_id)
     if not queue: active_workers.discard(chat_id); return
-
     while not queue.empty():
         message, tweet_ids, progress_msg = await queue.get()
         settings = await get_user_settings(message.from_user.id)
@@ -197,16 +195,12 @@ async def process_chat_queue(chat_id: int, bot: Bot):
                 try:
                     await progress_msg.edit_text(f"⏳ جاري معالجة الرابط **{i}** من **{total}**...", parse_mode="Markdown")
                     await process_single_tweet(message, tweet_id, settings)
-                except Exception as e:
-                    print(f"Unhandled error processing tweet {tweet_id}: {e}")
+                except Exception as e: print(f"Error processing tweet {tweet_id}: {e}")
             await progress_msg.edit_text(f"✅ اكتملت معالجة **{total}** روابط!", parse_mode="Markdown")
-            await asyncio.sleep(5)
-            await progress_msg.delete()
+            await asyncio.sleep(5); await progress_msg.delete()
             if settings.get("delete_original"):
                 try: await message.delete()
                 except Exception: pass
-        except Exception as e:
-            print(f"Fatal error in queue worker for chat {chat_id}: {e}")
         finally:
             queue.task_done()
     active_workers.discard(chat_id)
@@ -215,7 +209,6 @@ async def process_chat_queue(chat_id: int, bot: Bot):
 async def handle_twitter_links(message: types.Message, bot: Bot):
     tweet_ids = await extract_tweet_ids(message.text)
     if not tweet_ids: return
-
     progress_msg = await message.reply(f"تم استلام **{len(tweet_ids)}** روابط...", parse_mode="Markdown")
     chat_id = message.chat.id
     if chat_id not in chat_queues: chat_queues[chat_id] = asyncio.Queue()
@@ -226,22 +219,18 @@ async def handle_twitter_links(message: types.Message, bot: Bot):
         active_workers.add(chat_id)
         asyncio.create_task(process_chat_queue(chat_id, bot))
 
-# --- New Callback Handlers ---
-
 @router.callback_query(TweetActionCallback.filter(F.action == "show_text"))
 async def handle_show_text(callback: types.CallbackQuery, callback_data: TweetActionCallback):
     tweet_id = callback_data.tweet_id
     tweet_data = await scrape_media(tweet_id)
     tweet_text = "لم يتم العثور على نص لهذه التغريدة."
-    if tweet_data and tweet_data.get("text"):
-        tweet_text = tweet_data["text"]
+    if tweet_data and tweet_data.get("text"): tweet_text = tweet_data["text"]
     await callback.answer(tweet_text, show_alert=True, cache_time=60)
 
 @router.callback_query(TweetActionCallback.filter(F.action == "delete"))
 async def handle_delete_media(callback: types.CallbackQuery, callback_data: TweetActionCallback):
-    user_msg_id = callback_data.user_msg_id
     try: await callback.message.delete()
     except Exception: pass
-    try: await callback.bot.delete_message(chat_id=callback.message.chat.id, message_id=user_msg_id)
+    try: await callback.bot.delete_message(chat_id=callback.message.chat.id, message_id=callback_data.user_msg_id)
     except Exception: pass
     await callback.answer("تم الحذف.")

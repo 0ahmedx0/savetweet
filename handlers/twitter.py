@@ -123,7 +123,6 @@ def _escape_markdown_v2(text: str) -> str:
     return re.sub(f'([{re.escape(special)}])', r'\\\1', text)
 
 async def ytdlp_download_tweet_video(tweet_id: str, out_dir: Path) -> Optional[Path]:
-    # PATCH: تقوية yt-dlp: رؤوس متصفح، محاولات أكثر، وتجربة x.com ثم twitter.com + مهلة + تحقّق وجود yt-dlp
     import shutil as _shutil
     if _shutil.which('yt-dlp') is None:
         logger.warning("yt-dlp not found in PATH")
@@ -144,18 +143,14 @@ async def ytdlp_download_tweet_video(tweet_id: str, out_dir: Path) -> Optional[P
         '--no-warnings',
         '-o', str(output_path),
     ]
-    if config.X_COOKIES:
-        common.extend(['--cookies', str(config.X_COOKIES)])
-    else:
-        # ملاحظة: cookies-from-browser قد لا تعمل في الخوادم بلا بروفايل متصفح
-        common.extend(['--cookies-from-browser', 'chrome'])
 
     last_err = ""
     for url in base_urls:
-        # لو في ملف جزئي سابق لنفس المسار، امسحه قبل المحاولة
         if output_path.exists():
-            try: output_path.unlink()
-            except Exception: pass
+            try:
+                output_path.unlink()
+            except Exception:
+                pass
         cmd = [*common, url]
         try:
             process = await asyncio.create_subprocess_exec(
@@ -175,10 +170,8 @@ async def ytdlp_download_tweet_video(tweet_id: str, out_dir: Path) -> Optional[P
         if process.returncode == 0 and output_path.exists():
             return output_path
         last_err = err
-        # PATCH: إذا كان JSONDecodeError — جرب الرابط التالي
         if "JSONDecodeError" in err or "Failed to parse JSON" in err:
             continue
-        # إذا ما في فيديو، لا داعي لإعادة المحاولة
         if "No video could be found" in err:
             break
 

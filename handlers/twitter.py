@@ -431,7 +431,7 @@ async def process_chat_queue(chat_id: int, bot: Bot):
             last_progress_text = None
             for i, tweet_id in enumerate(tweet_ids, 1):
                 try:
-                    progress_text = f"⏳ جاري معالجة الرابط *{i}* من *{total}*"
+                    progress_text = (f"⏳ جاري معالجة الرابط *{escape_markdown(str(i))}* "     f"من *{escape_markdown(str(total))}*" )
                     if progress_text != last_progress_text:
                         try:
                             await progress_msg.edit_text(progress_text, parse_mode=ParseMode.MARKDOWN_V2)
@@ -446,7 +446,7 @@ async def process_chat_queue(chat_id: int, bot: Bot):
                     await process_single_tweet(message, tweet_id, settings)
                 except Exception as e: 
                     logger.error("Error processing tweet %s: %s", tweet_id, e)
-            done_text = f"✅ اكتملت معالجة *{total}* روابط!"
+            done_text = f"✅ اكتملت معالجة *{escape_markdown(str(total))}* روابط\\!"
             if done_text != last_progress_text:
                 try:
                     await progress_msg.edit_text(done_text, parse_mode=ParseMode.MARKDOWN_V2)

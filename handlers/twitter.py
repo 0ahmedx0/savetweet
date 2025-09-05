@@ -154,7 +154,7 @@ async def send_large_file_pyro(file_path: Path, caption: Optional[str] = None, p
 async def ensure_reply_markup(bot: Bot, base_message: Message, reply_markup: InlineKeyboardMarkup):
     """
     يحاول تعديل المارك-أب؛ وإن قال تيليجرام 'message is not modified'،
-    يرسل رسالة جديدة مع نفس الكيبورد لضمان ظهوره للمستخدم.
+    يرسل رسالة جديدة مع نفس الكيبورد ويُكمل بهدوء (بدون رمي استثناء).
     """
     try:
         await bot.edit_message_reply_markup(
@@ -167,8 +167,9 @@ async def ensure_reply_markup(bot: Bot, base_message: Message, reply_markup: Inl
         if "message is not modified" in msg:
             # أرسل رسالة جديدة بالكيبورد بدل التعديل
             await base_message.reply("🔗 الخيارات:", reply_markup=reply_markup, disable_web_page_preview=True)
+            # تم التعامل بدون رمي استثناء
         else:
-            # أخطاء أخرى يجب أن تظهر
+            # أخطاء أخرى (غير 'not modified') يجب أن تظهر
             raise
 
 # --- Functions with CRUCIAL FIX ---
@@ -278,7 +279,7 @@ async def process_chat_queue(chat_id: int, bot: Bot):
         settings = await get_user_settings(message.from_user.id)
         try:
             total = len(tweet_ids)
-            # PATCH: منع تكرار نفس النص حرفيًا لتجنّب 'message is not modified'
+            # PATCH: منع تكرار نفس النص حرفيًا + استبدال الرسالة عند "not modified"
             last_progress_text = None
             for i, tweet_id in enumerate(tweet_ids, 1):
                 try:
@@ -288,16 +289,24 @@ async def process_chat_queue(chat_id: int, bot: Bot):
                             await progress_msg.edit_text(progress_text, parse_mode="Markdown")
                             last_progress_text = progress_text
                         except TelegramBadRequest as e:
-                            if "message is not modified" not in (e.message or "").lower():
+                            if "message is not modified" in (e.message or "").lower():
+                                # ننشئ رسالة جديدة ونحوّل المؤشّر لها
+                                progress_msg = await message.reply(progress_text, parse_mode="Markdown")
+                                last_progress_text = progress_text
+                            else:
                                 raise
                     await process_single_tweet(message, tweet_id, settings)
-                except Exception as e: print(f"Error processing tweet {tweet_id}: {e}")
+                except Exception as e: 
+                    print(f"Error processing tweet {tweet_id}: {e}")
             done_text = f"✅ اكتملت معالجة *{total}* روابط!"
             if done_text != last_progress_text:
                 try:
                     await progress_msg.edit_text(done_text, parse_mode="Markdown")
                 except TelegramBadRequest as e:
-                    if "message is not modified" not in (e.message or "").lower():
+                    if "message is not modified" in (e.message or "").lower():
+                        # ننشئ رسالة جديدة للإنهاء ونحوّل المؤشّر لها لمرحلة الحذف لاحقًا
+                        progress_msg = await message.reply(done_text, parse_mode="Markdown")
+                    else:
                         raise
             await asyncio.sleep(5); await progress_msg.delete()
             if settings.get("delete_original"):

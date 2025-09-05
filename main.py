@@ -5,7 +5,7 @@ import sys
 
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
-from aiogram.client.default import DefaultBotProperties  # <-- مهم
+from aiogram.client.default import DefaultBotProperties
 
 import config
 from handlers import general, admin, twitter
@@ -14,16 +14,8 @@ async def main():
     # Logging
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
     
-    # Bot and Dispatcher setup (التعديل هنا)
-    bot = Bot(
-        token=config.BOT_TOKEN,
-        default=DefaultBotProperties(
-            parse_mode=ParseMode.MARKDOWN
-            # لو حاب، تقدر تضيف:
-            # disable_web_page_preview=True,
-            # protect_content=False,
-        )
-    )
+    # Bot and Dispatcher setup
+    bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dp = Dispatcher()
 
     # Include routers

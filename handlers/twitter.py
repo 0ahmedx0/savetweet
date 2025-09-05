@@ -307,15 +307,9 @@ def format_caption(tweet_data: dict) -> str:
     # غامق في V2: *...* و inline code في V2: `...` (نهربها مسبقًا)
     return _trim_caption(f"🐦 *بواسطة:* {user_name} \\(`@{user_screen_name}`\\)")
 
-def create_inline_keyboard(tweet_data: dict, user_msg_id: int) -> InlineKeyboardMarkup:
-    tweet_url = tweet_data.get("tweetURL", "")
-    tweet_id = tweet_data.get("id", "0")
-    if not tweet_url: return None
-    builder = InlineKeyboardBuilder()
-    builder.button(text="🔗 الرابط الأصلي", url=tweet_url)
-    builder.button(text="🗑️ حذف", callback_data=TweetActionCallback(action="delete", tweet_id=tweet_id, user_msg_id=user_msg_id))
-    builder.adjust(2)
-    return builder.as_markup()
+def create_inline_keyboard(tweet_data: dict, user_msg_id: int) -> Optional[InlineKeyboardMarkup]:
+    # إلغاء الأزرار نهائياً
+    return None
 
 async def send_tweet_text_reply(original_message: Message, last_media_message: Message, tweet_data: dict):
     tweet_text = tweet_data.get("text")

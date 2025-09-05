@@ -59,7 +59,7 @@ async def extract_tweet_ids(text: str) -> Optional[List[str]]:
     return ordered_unique_ids if ordered_unique_ids else None
 
 async def ytdlp_download_tweet_video(tweet_id: str, out_dir: Path) -> Optional[Path]:
-    # PATCH: تقوية yt-dlp: رؤوس متصفح + محاولات أكثر + تجربة x.com ثم twitter.com
+    # PATCH: تقوية yt-dlp: رؤوس متصفح، محاولات أكثر، وتجربة x.com ثم twitter.com
     base_urls = [
         f"https://x.com/i/status/{tweet_id}",
         f"https://twitter.com/i/status/{tweet_id}",
@@ -80,7 +80,9 @@ async def ytdlp_download_tweet_video(tweet_id: str, out_dir: Path) -> Optional[P
     last_err = ""
     for url in base_urls:
         cmd = [*common, url]
-        process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
         stdout, stderr = await process.communicate()
         err = stderr.decode(errors="ignore")
         if process.returncode == 0 and output_path.exists(): return output_path
@@ -100,7 +102,7 @@ async def scrape_media(tweet_id: str) -> Optional[dict]:
     api_url = f"https://api.vxtwitter.com/i/status/{tweet_id}"
     try:
         async with _get_session() as session, session.get(api_url) as response:
-            if response.status == 200: 
+            if response.status == 200:
                 data = await response.json()
                 # PATCH: اختيار أفضل نسخة فيديو (إن توفرت variants)
                 media_items = data.get("media_extended") or []
@@ -148,6 +150,26 @@ async def send_large_file_pyro(file_path: Path, caption: Optional[str] = None, p
         except Exception:
             pass
 
+# --- دالة تضمن ظهور الكيبورد دائمًا (لا تطنيش) ---
+async def ensure_reply_markup(bot: Bot, base_message: Message, reply_markup: InlineKeyboardMarkup):
+    """
+    يحاول تعديل المارك-أب؛ وإن قال تيليجرام 'message is not modified'،
+    يرسل رسالة جديدة مع نفس الكيبورد لضمان ظهوره للمستخدم.
+    """
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=base_message.chat.id,
+            message_id=base_message.message_id,
+            reply_markup=reply_markup
+        )
+    except TelegramBadRequest as e:
+        msg = (e.message or "").lower()
+        if "message is not modified" in msg:
+            # أرسل رسالة جديدة بالكيبورد بدل التعديل
+            await base_message.reply("🔗 الخيارات:", reply_markup=reply_markup, disable_web_page_preview=True)
+        else:
+            # أخطاء أخرى يجب أن تظهر
+            raise
 
 # --- Functions with CRUCIAL FIX ---
 def escape_markdown(text: str) -> str:
@@ -190,7 +212,6 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
         video_path = await ytdlp_download_tweet_video(tweet_id, temp_dir)
         if video_path:
             tweet_url = f"https://x.com/i/status/{tweet_id}"
-            # PATCH: استخدام * بدل ** في Markdown
             caption = f"🐦 [فيديو من تويتر]({tweet_url})"
             keyboard = create_inline_keyboard({"tweetURL": tweet_url, "id": tweet_id}, user_msg_id=message.message_id)
             if video_path.stat().st_size > config.MAX_FILE_SIZE:
@@ -231,7 +252,9 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
                 if not media_group: continue
                 sent_messages = await message.reply_media_group(media_group)
                 last_sent_message = sent_messages[-1]
-                if keyboard: await bot.edit_message_reply_markup(chat_id=last_sent_message.chat.id, message_id=last_sent_message.message_id, reply_markup=keyboard)
+                if keyboard:
+                    # PATCH: ضمان ظهور الكيبورد حتى لو فشل التعديل
+                    await ensure_reply_markup(bot, last_sent_message, keyboard)
         
         for video_path in videos:
             if video_path.stat().st_size > config.MAX_FILE_SIZE:
@@ -255,15 +278,27 @@ async def process_chat_queue(chat_id: int, bot: Bot):
         settings = await get_user_settings(message.from_user.id)
         try:
             total = len(tweet_ids)
+            # PATCH: منع تكرار نفس النص حرفيًا لتجنّب 'message is not modified'
+            last_progress_text = None
             for i, tweet_id in enumerate(tweet_ids, 1):
                 try:
-                    try:
-                        await progress_msg.edit_text(f"⏳ جاري معالجة الرابط *{i}* من *{total}*...", parse_mode="Markdown")
-                    except TelegramBadRequest as e:
-                        if "message is not modified" not in e.message: raise
+                    progress_text = f"⏳ جاري معالجة الرابط *{i}* من *{total}*..."
+                    if progress_text != last_progress_text:
+                        try:
+                            await progress_msg.edit_text(progress_text, parse_mode="Markdown")
+                            last_progress_text = progress_text
+                        except TelegramBadRequest as e:
+                            if "message is not modified" not in (e.message or "").lower():
+                                raise
                     await process_single_tweet(message, tweet_id, settings)
                 except Exception as e: print(f"Error processing tweet {tweet_id}: {e}")
-            await progress_msg.edit_text(f"✅ اكتملت معالجة *{total}* روابط!", parse_mode="Markdown")
+            done_text = f"✅ اكتملت معالجة *{total}* روابط!"
+            if done_text != last_progress_text:
+                try:
+                    await progress_msg.edit_text(done_text, parse_mode="Markdown")
+                except TelegramBadRequest as e:
+                    if "message is not modified" not in (e.message or "").lower():
+                        raise
             await asyncio.sleep(5); await progress_msg.delete()
             if settings.get("delete_original"):
                 try: await message.delete()

@@ -12,7 +12,7 @@ import logging
 import aiohttp
 from aiogram import Bot, Router, F, types
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import (FSInputFile, InputMediaPhoto, Message,
                            ReactionTypeEmoji, InlineKeyboardMarkup, InlineKeyboardButton)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
@@ -30,6 +30,23 @@ download_semaphore = asyncio.Semaphore(4)
 
 # --- Logging ---
 logger = logging.getLogger(__name__)
+
+# --- Rate limit & debounce state ---
+# عدد التعديلات المسموحة لكل محادثة: تعديل واحد كل 3 ثوانٍ (قابل للضبط).
+EDIT_MIN_INTERVAL_SECONDS = 3
+# تخزين آخر وقت تحرير لكل محادثة (ديبونس بسيط)
+_LAST_EDIT_AT: Dict[int, float] = {}
+# عشان ما نعدل بنفس النص حرفيًا عدة مرات
+_LAST_PROGRESS_TEXT: Dict[int, str] = {}
+
+# لو حاب تستخدم Token Bucket حقيقي، فعّل aiolimiter أدناه:
+try:
+    from aiolimiter import AsyncLimiter
+    _HAS_AIOLIMITER = True
+except Exception:
+    _HAS_AIOLIMITER = False
+from collections import defaultdict
+_chat_limiters = defaultdict(lambda: AsyncLimiter(1, EDIT_MIN_INTERVAL_SECONDS)) if _HAS_AIOLIMITER else None
 
 # --- Session Manager (reuse a single aiohttp session) ---
 _session: Optional[aiohttp.ClientSession] = None
@@ -277,11 +294,20 @@ async def ensure_reply_markup(bot: Bot, base_message: Message, reply_markup: Inl
     يرسل رسالة جديدة مع نفس الكيبورد ويُكمل بهدوء (بدون رمي استثناء).
     """
     try:
-        await bot.edit_message_reply_markup(
-            chat_id=base_message.chat.id,
-            message_id=base_message.message_id,
-            reply_markup=reply_markup
-        )
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=base_message.chat.id,
+                message_id=base_message.message_id,
+                reply_markup=reply_markup
+            )
+        except TelegramRetryAfter as e:
+            # احترام flood control من تيليجرام
+            await asyncio.sleep(e.retry_after)
+            await bot.edit_message_reply_markup(
+                chat_id=base_message.chat.id,
+                message_id=base_message.message_id,
+                reply_markup=reply_markup
+            )
     except TelegramBadRequest as e:
         msg = (e.message or "").lower()
         if "message is not modified" in msg:
@@ -412,6 +438,71 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
     finally:
         if temp_dir.exists(): shutil.rmtree(temp_dir, ignore_errors=True)
 
+# --- Safe edit wrappers (CRUCIAL) ---
+def _should_edit_now(chat_id: int) -> bool:
+    """ديبونس: لا نسمح بأكثر من تعديل كل EDIT_MIN_INTERVAL_SECONDS للمحادثة."""
+    import time
+    now = time.monotonic()
+    last = _LAST_EDIT_AT.get(chat_id, 0.0)
+    if now - last >= EDIT_MIN_INTERVAL_SECONDS:
+        _LAST_EDIT_AT[chat_id] = now
+        return True
+    return False
+
+async def _rate_gate(chat_id: int):
+    """بوابة محدِّد المعدل. تستخدم aiolimiter إن وجد، وإلا تعتمد على الديبونس فقط."""
+    if _HAS_AIOLIMITER and _chat_limiters is not None:
+        async with _chat_limiters[chat_id]:
+            return
+    # بدون aiolimiter، ننتظر حتى يسمح الديبونس بتعديل جديد
+    while not _should_edit_now(chat_id):
+        await asyncio.sleep(0.3)
+
+async def safe_edit_text(progress_msg: Message, text: str, *, parse_mode: ParseMode, source_msg_for_fallback: Optional[Message] = None) -> Message:
+    """
+    يحرر نص الرسالة بأمان:
+    - يحترم محدد المعدل (rate gate)
+    - يحترم TelegramRetryAfter
+    - يتعامل مع 'message is not modified' بإنشاء رسالة جديدة عند الحاجة
+    يعيد مؤشر Message (قد يتغير لو أنشأنا رسالة بديلة).
+    """
+    chat_id = progress_msg.chat.id
+    # اختصار: لا تعدّل لو النص السابق مطابق
+    if _LAST_PROGRESS_TEXT.get(chat_id) == text:
+        return progress_msg
+    await _rate_gate(chat_id)
+    try:
+        await progress_msg.edit_text(text, parse_mode=parse_mode)
+        _LAST_PROGRESS_TEXT[chat_id] = text
+        return progress_msg
+    except TelegramRetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        try:
+            await progress_msg.edit_text(text, parse_mode=parse_mode)
+            _LAST_PROGRESS_TEXT[chat_id] = text
+            return progress_msg
+        except TelegramBadRequest as e2:
+            # fallback لنص مطابق/رسالة غير قابلة للتحرير
+            if "message is not modified" in (e2.message or "").lower():
+                _LAST_PROGRESS_TEXT[chat_id] = text
+                return progress_msg
+            # لو فشل التحرير (تم حذفه/قديم)، ننشئ رسالة جديدة لو توفر مصدر
+            if source_msg_for_fallback is not None:
+                new_msg = await source_msg_for_fallback.reply(text, parse_mode=parse_mode)
+                _LAST_PROGRESS_TEXT[chat_id] = text
+                return new_msg
+            raise
+    except TelegramBadRequest as e:
+        if "message is not modified" in (e.message or "").lower():
+            _LAST_PROGRESS_TEXT[chat_id] = text
+            return progress_msg
+        # fallback: رسالة جديدة عند تعذّر التحرير (مثلاً الرسالة أصبحت قديمة جداً)
+        if source_msg_for_fallback is not None:
+            new_msg = await source_msg_for_fallback.reply(text, parse_mode=parse_mode)
+            _LAST_PROGRESS_TEXT[chat_id] = text
+            return new_msg
+        raise
+
 # --- Queue and Handler Logic with Fixes ---
 async def process_chat_queue(chat_id: int, bot: Bot):
     queue = chat_queues.get(chat_id)
@@ -421,35 +512,27 @@ async def process_chat_queue(chat_id: int, bot: Bot):
         settings = await get_user_settings(message.from_user.id)
         try:
             total = len(tweet_ids)
-            # PATCH: منع تكرار نفس النص حرفيًا + استبدال الرسالة عند "not modified"
-            last_progress_text = None
             for i, tweet_id in enumerate(tweet_ids, 1):
                 try:
-                    progress_text = (f"⏳ جاري معالجة الرابط *{escape_markdown(str(i))}* "     f"من *{escape_markdown(str(total))}*" )
-                    if progress_text != last_progress_text:
-                        try:
-                            await progress_msg.edit_text(progress_text, parse_mode=ParseMode.MARKDOWN_V2)
-                            last_progress_text = progress_text
-                        except TelegramBadRequest as e:
-                            if "message is not modified" in (e.message or "").lower():
-                                # ننشئ رسالة جديدة ونحوّل المؤشّر لها
-                                progress_msg = await message.reply(progress_text, parse_mode=ParseMode.MARKDOWN_V2)
-                                last_progress_text = progress_text
-                            else:
-                                raise
+                    progress_text = (f"⏳ جاري معالجة الرابط *{escape_markdown(str(i))}* "
+                                     f"من *{escape_markdown(str(total))}*")
+                    # تحرير آمن يحترم Flood Control + ديبونس + fallback
+                    progress_msg = await safe_edit_text(
+                        progress_msg,
+                        progress_text,
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        source_msg_for_fallback=message
+                    )
                     await process_single_tweet(message, tweet_id, settings)
                 except Exception as e: 
                     logger.error("Error processing tweet %s: %s", tweet_id, e)
             done_text = f"✅ اكتملت معالجة *{escape_markdown(str(total))}* روابط\\!"
-            if done_text != last_progress_text:
-                try:
-                    await progress_msg.edit_text(done_text, parse_mode=ParseMode.MARKDOWN_V2)
-                except TelegramBadRequest as e:
-                    if "message is not modified" in (e.message or "").lower():
-                        # ننشئ رسالة جديدة للإنهاء ونحوّل المؤشّر لها لمرحلة الحذف لاحقًا
-                        progress_msg = await message.reply(done_text, parse_mode=ParseMode.MARKDOWN_V2)
-                    else:
-                        raise
+            progress_msg = await safe_edit_text(
+                progress_msg,
+                done_text,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                source_msg_for_fallback=message
+            )
             await asyncio.sleep(5); 
             try:
                 await progress_msg.delete()

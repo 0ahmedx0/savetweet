@@ -1,15 +1,13 @@
 # handlers/twitter.py
-
-# --- الإضافات والتحسينات ---
-import logging
-# --- نهاية الإضافات ---
-
 import asyncio
 import re
 import shutil
 import uuid
 from pathlib import Path
 from typing import List, Dict, Optional
+from urllib.parse import urlparse
+import mimetypes
+import logging
 
 import aiohttp
 from aiogram import Bot, Router, F, types
@@ -25,60 +23,112 @@ import config
 from db import get_user_settings
 from utils import TweetActionCallback
 
-# --- التحسين 1: استخدام نظام تسجيل احترافي بدلاً من print ---
-logger = logging.getLogger(__name__)
-
 router = Router()
 chat_queues: Dict[int, asyncio.Queue] = {}
 active_workers: set[int] = set()
 download_semaphore = asyncio.Semaphore(4)
 
+# --- Logging ---
+logger = logging.getLogger(__name__)
 
-# --- Helper Functions (مع تحسينات) ---
+# --- Session Manager (reuse a single aiohttp session) ---
+_session: Optional[aiohttp.ClientSession] = None
 
-def _get_session() -> aiohttp.ClientSession:
-    timeout = aiohttp.ClientTimeout(total=120, connect=30, sock_read=120)
-    headers = {
+def _default_headers() -> Dict[str, str]:
+    return {
         "User-Agent": "Mozilla/5.0",
         "Accept-Language": "en-US,en;q=0.9,ar;q=0.8",
     }
-    return aiohttp.ClientSession(timeout=timeout, headers=headers)
 
-# --- التحسين 2: تسريع فك روابط t.co بمعالجتها بالتوازي ---
+def _get_session() -> aiohttp.ClientSession:
+    """
+    PATCH: إعادة استخدام جلسة aiohttp واحدة لتقليل الـ overhead وتحسين الأداء.
+    """
+    global _session
+    if _session and not _session.closed:
+        return _session
+    timeout = aiohttp.ClientTimeout(total=120, connect=30, sock_read=120)
+    _session = aiohttp.ClientSession(timeout=timeout, headers=_default_headers())
+    return _session
+
+async def _close_session():
+    global _session
+    if _session and not _session.closed:
+        await _session.close()
+    _session = None
+
+# --- Helper Functions (No changes here, مع تعديلات داخلية طفيفة) ---
 async def extract_tweet_ids(text: str) -> Optional[List[str]]:
-    url_pattern = r'https?://(?:(?:www\.)?(?:twitter|x)\.com/\S+/status/\d+|t\.co/\S+)'
+    # PATCH: دعم mobile.twitter.com + موازاة فك t.co
+    url_pattern = r'https?://(?:(?:www\.)?(?:twitter|x|mobile\.twitter)\.com/\S+/status/\d+|t\.co/\S+)'
     urls = re.findall(url_pattern, text)
-    if not urls:
-        return None
+    if not urls: return None
 
-    async def resolve_url(session: aiohttp.ClientSession, url: str) -> Optional[str]:
+    session = _get_session()
+
+    async def resolve(url: str) -> Optional[str]:
+        current_tweet_id = None
         if 't.co/' in url:
             try:
-                # استخدم GET لأنه أكثر موثوقية من HEAD
-                async with session.get(url, allow_redirects=True, timeout=15) as response:
+                # PATCH: استخدم GET بدل HEAD لأن بعض النواقل تمنع HEAD
+                async with session.get(url, allow_redirects=True) as response:
                     match = re.search(r'/status/(\d+)', str(response.url))
-                    return match.group(1) if match else None
+                    if match: current_tweet_id = match.group(1)
             except Exception as e:
-                logger.warning(f"Could not resolve t.co link {url}: {e}")
+                logger.warning("Could not resolve %s: %s", url, e)
                 return None
         else:
             match = re.search(r'/status/(\d+)', url)
-            return match.group(1) if match else None
+            if match: current_tweet_id = match.group(1)
+        return current_tweet_id
 
-    async with _get_session() as session:
-        tasks = [resolve_url(session, url) for url in urls]
-        resolved_ids = await asyncio.gather(*tasks)
-
+    ids = await asyncio.gather(*(resolve(u) for u in urls))
     ordered_unique_ids, seen_ids = [], set()
-    for tweet_id in resolved_ids:
-        if tweet_id and tweet_id not in seen_ids:
-            ordered_unique_ids.append(tweet_id)
-            seen_ids.add(tweet_id)
-
+    for tid in ids:
+        if tid and tid not in seen_ids:
+            ordered_unique_ids.append(tid)
+            seen_ids.add(tid)
     return ordered_unique_ids if ordered_unique_ids else None
 
-# --- التحسين 3: زيادة موثوقية yt-dlp ---
+def _unique_media_path(base_dir: Path, media_url: str) -> Path:
+    """
+    PATCH: توليد اسم ملف فريد باستخدام uuid مع محاولة الحفاظ على الامتداد إن وُجد.
+    """
+    parsed = urlparse(media_url)
+    name = Path(parsed.path).name
+    name = name.split('?')[0]
+    # خذ الامتداد إن موجود، وإلا يحدد لاحقًا من Content-Type
+    ext = ''.join(Path(name).suffixes) if '.' in name else ''
+    if ext and not ext.startswith('.'):
+        ext = f'.{ext}'
+    return base_dir / f"{uuid.uuid4().hex}{ext}"
+
+def _trim_caption(text: str, limit: int = 1024) -> str:
+    """
+    PATCH: قصّ الكابشن لا يتجاوز حدود تيليجرام.
+    """
+    if len(text) <= limit:
+        return text
+    return text[:limit - 1] + "…"
+
+def _escape_markdown_v2(text: str) -> str:
+    """
+    <<< الإصلاح الحاسم: توحيد MarkdownV2 >>>
+    نهرب كل محارف MarkdownV2 حسب دليل تيليجرام.
+    """
+    if not text:
+        return ""
+    # القائمة الرسمية لمحارف MarkdownV2 الخاصة
+    special = r'_\*\[\]\(\)~`>#+\-=|{}\.!'
+    return re.sub(f'([{re.escape(special)}])', r'\\\1', text)
+
 async def ytdlp_download_tweet_video(tweet_id: str, out_dir: Path) -> Optional[Path]:
+    # PATCH: تقوية yt-dlp: رؤوس متصفح، محاولات أكثر، وتجربة x.com ثم twitter.com + مهلة + تحقّق وجود yt-dlp
+    import shutil as _shutil
+    if _shutil.which('yt-dlp') is None:
+        logger.warning("yt-dlp not found in PATH")
+        return None
+
     base_urls = [
         f"https://x.com/i/status/{tweet_id}",
         f"https://twitter.com/i/status/{tweet_id}",
@@ -94,70 +144,59 @@ async def ytdlp_download_tweet_video(tweet_id: str, out_dir: Path) -> Optional[P
         '--no-warnings',
         '-o', str(output_path),
     ]
-
-    # استخدام الكوكيز من الملف أو كخيار احتياطي من المتصفح
-    if config.X_COOKIES and Path(config.X_COOKIES).exists():
+    if config.X_COOKIES:
         common.extend(['--cookies', str(config.X_COOKIES)])
     else:
-        # يمكنك تغيير 'chrome' إلى 'firefox', 'edge', etc.
+        # ملاحظة: cookies-from-browser قد لا تعمل في الخوادم بلا بروفايل متصفح
         common.extend(['--cookies-from-browser', 'chrome'])
 
     last_err = ""
     for url in base_urls:
-        # حذف الملف الجزئي إذا كان موجوداً من محاولة سابقة فاشلة
+        # لو في ملف جزئي سابق لنفس المسار، امسحه قبل المحاولة
         if output_path.exists():
-            try:
-                output_path.unlink()
-            except OSError as e:
-                logger.error(f"Could not remove partial file {output_path}: {e}")
-        
+            try: output_path.unlink()
+            except Exception: pass
         cmd = [*common, url]
         try:
             process = await asyncio.create_subprocess_exec(
                 *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
             )
-            # إضافة مهلة زمنية لمنع العملية من التعليق
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=180.0)
-            err = stderr.decode(errors="ignore")
-
-            if process.returncode == 0 and output_path.exists():
-                return output_path
-            
-            last_err = err
-            if "JSONDecodeError" in err or "Failed to parse JSON" in err:
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=180)
+            except asyncio.TimeoutError:
+                process.kill()
+                logger.warning("yt-dlp timed out for %s", url)
                 continue
-            if "No video could be found" in err:
-                break
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
-            logger.error(f"yt-dlp timed out for tweet {tweet_id}")
-            last_err = "Timeout"
-            break
         except Exception as e:
-            logger.error(f"yt-dlp subprocess error for tweet {tweet_id}: {e}")
-            last_err = str(e)
+            logger.error("yt-dlp exec failed for %s: %s", url, e)
+            continue
+
+        err = stderr.decode(errors="ignore")
+        if process.returncode == 0 and output_path.exists():
+            return output_path
+        last_err = err
+        # PATCH: إذا كان JSONDecodeError — جرب الرابط التالي
+        if "JSONDecodeError" in err or "Failed to parse JSON" in err:
+            continue
+        # إذا ما في فيديو، لا داعي لإعادة المحاولة
+        if "No video could be found" in err:
+            break
 
     if last_err and "No video could be found" not in last_err:
-        logger.error(f"yt-dlp failed for tweet {tweet_id}: {last_err}")
+        logger.warning("yt-dlp failed for tweet %s: %s", tweet_id, last_err)
     return None
 
-# --- التحسين 4: تحصين الكود ضد تغيرات API ---
 async def scrape_media(tweet_id: str) -> Optional[dict]:
     api_url = f"https://api.vxtwitter.com/i/status/{tweet_id}"
     try:
-        async with _get_session() as session, session.get(api_url) as response:
+        session = _get_session()
+        async with session.get(api_url) as response:
             if response.status == 200:
                 data = await response.json()
-                # التأكد من وجود الحقول الأساسية وتعيين قيم افتراضية
-                data.setdefault("tweetURL", f"https://x.com/i/status/{tweet_id}")
-                data.setdefault("id", tweet_id)
-
+                # PATCH: حواجز بنية + اختيار أفضل variant
                 media_items = data.get("media_extended") or []
-                # التأكد من أن media_items هو قائمة دائماً
                 if not isinstance(media_items, list):
                     media_items = []
-                    
                 for m in media_items:
                     if m.get("type") in ("video", "gif") and isinstance(m.get("variants"), list):
                         best = max(
@@ -166,76 +205,84 @@ async def scrape_media(tweet_id: str) -> Optional[dict]:
                             default=None
                         )
                         if best: m["url"] = best["url"]
-                
-                # إعادة تعيين القائمة المعالجة
-                data["media_extended"] = media_items
+                data.setdefault("tweetURL", f"https://x.com/i/status/{tweet_id}")
+                data.setdefault("id", tweet_id)
                 return data
             return None
     except Exception as e:
-        logger.exception(f"vxtwitter scrape failed for {tweet_id}: {e}")
+        logger.warning("vxtwitter scrape failed for %s: %s", tweet_id, e)
         return None
 
-# --- التحسين 5: إضافة إعادة محاولات للتنزيل وتعقيم اسم الملف ---
-def _safe_filename(url: str) -> str:
-    """ينظف اسم الملف من الـ URL."""
-    name = Path(url).name.split('?')[0]
-    return re.sub(r'[^a-zA-Z0-9._-]', '_', name)
-
-async def download_media(session: aiohttp.ClientSession, media_url: str, file_path: Path, retries: int = 3) -> bool:
+async def download_media(session: aiohttp.ClientSession, media_url: str, file_path: Path) -> bool:
+    # PATCH: retries + backoff + استنتاج الامتداد من Content-Type عند اللزوم
     async with download_semaphore:
-        for attempt in range(retries):
+        backoffs = [0, 1, 2, 4]
+        last_exc = None
+        for delay in backoffs:
+            if delay:
+                await asyncio.sleep(delay)
             try:
-                async with session.get(media_url) as response:
+                async with session.get(media_url, timeout=aiohttp.ClientTimeout(total=180)) as response:
                     if response.status == 200:
+                        # استنتج الامتداد إذا كان المسار بلا امتداد
+                        if not file_path.suffix:
+                            ctype = response.headers.get("Content-Type", "")
+                            guessed = mimetypes.guess_extension(ctype.split(";")[0].strip()) or ""
+                            if guessed:
+                                try:
+                                    file_path = file_path.with_suffix(guessed)
+                                except Exception:
+                                    pass
                         with open(file_path, "wb") as f:
                             async for chunk in response.content.iter_chunked(8192):
                                 f.write(chunk)
                         return True
-                    else:
-                        logger.warning(f"Failed to download {media_url}, status: {response.status}")
             except Exception as e:
-                logger.warning(f"Download attempt {attempt+1}/{retries} for {media_url} failed: {e}")
-                if attempt < retries - 1:
-                    await asyncio.sleep(1.5)  # انتظر قليلاً قبل إعادة المحاولة
+                last_exc = e
+                continue
+        if last_exc:
+            logger.warning("download_media failed for %s: %s", media_url, last_exc)
     return False
 
-# --- التحسين 6: تحسين معالجة Pyrogram ---
-async def send_large_file_pyro(file_path: Path, caption: Optional[str] = None, markup: Optional[InlineKeyboardMarkup] = None):
-    # ملاحظة: إنشاء العميل لكل مرة ليس الأمثل أداءً، لكنه آمن.
-    # الحل المتقدم هو استخدام Singleton client.
+async def send_large_file_pyro(file_path: Path, caption: Optional[str] = None, parse_mode: str = "Markdown", markup: Optional[InlineKeyboardMarkup] = None):
     app = PyroClient("user_bot", api_id=config.API_ID, api_hash=config.API_HASH, session_string=config.PYRO_SESSION_STRING, in_memory=True)
     try:
         await app.start()
         from pyrogram.enums import ParseMode as PyroParseMode
-        # استخدام MarkdownV2 بشكل متسق
-        pyro_parse_mode = PyroParseMode.MARKDOWN
-        
-        # تحسين معالجة FloodWait لتجنب الاستدعاء الذاتي الغير محدود
-        while True:
+        # PATCH: عند تمرير "MarkdownV2" نخليها بدون parse لتفادي تعارض V2
+        if parse_mode and parse_mode.lower() in ("markdownv2", "markdown_v2"):
+            pyro_parse_mode = None
+        elif parse_mode and parse_mode.lower() == "markdown":
+            pyro_parse_mode = PyroParseMode.MARKDOWN
+        else:
+            pyro_parse_mode = PyroParseMode.HTML
+        await app.send_video(config.CHANNEL_ID, str(file_path), caption=caption, parse_mode=pyro_parse_mode, reply_markup=markup)
+        await app.stop()
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        try:
+            # إعادة الإرسال بعد الانتظار
+            await app.send_video(config.CHANNEL_ID, str(file_path), caption=caption, parse_mode=pyro_parse_mode, reply_markup=markup)
+        finally:
             try:
-                await app.send_video(
-                    config.CHANNEL_ID,
-                    str(file_path),
-                    caption=caption,
-                    parse_mode=pyro_parse_mode,
-                    reply_markup=markup
-                )
-                break # الخروج من الحلقة عند النجاح
-            except FloodWait as e:
-                logger.warning(f"Pyrogram FloodWait: sleeping for {e.value} seconds.")
-                await asyncio.sleep(e.value + 2) # الانتظار للمدة المطلوبة + ثانيتين
-            
+                await app.stop()
+            except Exception:
+                pass
     except Exception as e:
-        logger.exception(f"Pyrogram failed to send large file: {e}")
-    finally:
+        logger.error("Pyrogram failed: %s", e)
+        # PATCH: is_connected خاصية وليست awaitable
         try:
             if getattr(app, "is_connected", False):
                 await app.stop()
-        except Exception as e:
-            logger.error(f"Failed to stop pyrogram client: {e}")
+        except Exception:
+            pass
 
-
+# --- دالة تضمن ظهور الكيبورد دائمًا (لا تطنيش) ---
 async def ensure_reply_markup(bot: Bot, base_message: Message, reply_markup: InlineKeyboardMarkup):
+    """
+    يحاول تعديل المارك-أب؛ وإن قال تيليجرام 'message is not modified'،
+    يرسل رسالة جديدة مع نفس الكيبورد ويُكمل بهدوء (بدون رمي استثناء).
+    """
     try:
         await bot.edit_message_reply_markup(
             chat_id=base_message.chat.id,
@@ -245,21 +292,27 @@ async def ensure_reply_markup(bot: Bot, base_message: Message, reply_markup: Inl
     except TelegramBadRequest as e:
         msg = (e.message or "").lower()
         if "message is not modified" in msg:
-            await base_message.reply("🔗 *الخيارات:*", reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN_V2)
+            # أرسل رسالة جديدة بالكيبورد بدل التعديل
+            await base_message.reply("🔗 الخيارات:", reply_markup=reply_markup, disable_web_page_preview=True)
+            # تم التعامل بدون رمي استثناء
         else:
+            # أخطاء أخرى (غير 'not modified') يجب أن تظهر
             raise
 
 # --- Functions with CRUCIAL FIX ---
-# --- التحسين 7: الانتقال الكامل إلى MarkdownV2 ---
-def escape_markdown_v2(text: str) -> str:
-    """دالة تهريب الرموز المتوافقة مع MarkdownV2."""
-    escape_chars = r'\_*[]()~`>#+-=|{}.!'
-    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+def escape_markdown(text: str) -> str:
+    """
+    <<< الإصلاح الحاسم هنا: إعادة دالة تهريب الرموز >>>
+    تم توحيدها على MarkdownV2 لتتلاءم مع parse_mode الموحد.
+    """
+    return _escape_markdown_v2(text)
 
 def format_caption(tweet_data: dict) -> str:
-    user_name = escape_markdown_v2(tweet_data.get("user_name", "Unknown"))
-    user_screen_name = escape_markdown_v2(tweet_data.get("user_screen_name", "unknown"))
-    return f"🐦 *بواسطة:* {user_name} (`@{user_screen_name}`)"
+    # PATCH: استخدام MarkdownV2 مع تهريب النصوص
+    user_name = escape_markdown(tweet_data.get("user_name", "Unknown"))
+    user_screen_name = escape_markdown(tweet_data.get("user_screen_name", "unknown"))
+    # غامق في V2: *...* و inline code في V2: `...` (نهربها مسبقًا)
+    return _trim_caption(f"🐦 *بواسطة:* {user_name} \\(`@{user_screen_name}`\\)")
 
 def create_inline_keyboard(tweet_data: dict, user_msg_id: int) -> InlineKeyboardMarkup:
     tweet_url = tweet_data.get("tweetURL", "")
@@ -274,7 +327,8 @@ def create_inline_keyboard(tweet_data: dict, user_msg_id: int) -> InlineKeyboard
 async def send_tweet_text_reply(original_message: Message, last_media_message: Message, tweet_data: dict):
     tweet_text = tweet_data.get("text")
     if tweet_text:
-        safe_text = escape_markdown_v2(tweet_text)
+        # <<< تطبيق الإصلاح هنا قبل الإرسال (MarkdownV2) >>>
+        safe_text = escape_markdown(tweet_text)
         await last_media_message.reply(f"📝 *نص التغريدة:*\n\n{safe_text}", parse_mode=ParseMode.MARKDOWN_V2, disable_web_page_preview=True)
 
 async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
@@ -286,18 +340,17 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
     try:
         video_path = await ytdlp_download_tweet_video(tweet_id, temp_dir)
         if video_path:
-            # لا حاجة لتهريب الرابط في صيغة [text](URL)
             tweet_url = f"https://x.com/i/status/{tweet_id}"
-            caption = f"🐦 [فيديو من تويتر]({tweet_url})"
+            # PATCH: لتفادي اختلافات Markdown بين البوت و Pyrogram، نخلي الكابتشن بسيط بدون تنسيق
+            caption_plain = _trim_caption(f"🐦 فيديو من تويتر: {tweet_url}")
             keyboard = create_inline_keyboard({"tweetURL": tweet_url, "id": tweet_id}, user_msg_id=message.message_id)
-            
             if video_path.stat().st_size > config.MAX_FILE_SIZE:
-                # Pyrogram uses its own Markdown parser, which is similar to V2
-                await send_large_file_pyro(video_path, caption, keyboard)
-                last_sent_message = await message.reply("✅ تم رفع الفيديو بنجاح للقناة\\.", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN_V2)
+                await send_large_file_pyro(video_path, caption_plain, "MarkdownV2", keyboard)
+                last_sent_message = await message.reply("✅ تم رفع الفيديو بنجاح للقناة.", reply_markup=keyboard)
             else:
-                last_sent_message = await message.reply_video(FSInputFile(video_path), caption=caption, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
+                last_sent_message = await message.reply_video(FSInputFile(video_path), caption=caption_plain, reply_markup=keyboard)
             
+            # Since yt-dlp doesn't reliably fetch text, we will fetch it now if needed.
             if settings.get("send_text"):
                 tweet_data = await scrape_media(tweet_id)
                 if tweet_data: await send_tweet_text_reply(message, last_sent_message, tweet_data)
@@ -305,39 +358,64 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
 
         tweet_data = await scrape_media(tweet_id)
         if not tweet_data or not tweet_data.get("media_extended"):
-            safe_url = escape_markdown_v2(f"https://x.com/i/status/{tweet_id}")
-            await message.reply(f"لم أتمكن من العثور على وسائط للتغريدة:\n{safe_url}", parse_mode=ParseMode.MARKDOWN_V2)
+            await message.reply(f"لم أتمكن من العثور على وسائط للتغريدة:\nhttps://x.com/i/status/{tweet_id}")
             return
         
         caption = format_caption(tweet_data)
         keyboard = create_inline_keyboard(tweet_data, user_msg_id=message.message_id)
 
         media_items = tweet_data.get("media_extended", [])
-        photos, videos = [], []
-        async with _get_session() as session:
-            tasks = [download_media(session, item['url'], temp_dir / _safe_filename(item['url'])) for item in media_items]
-            await asyncio.gather(*tasks)
+        session = _get_session()
 
+        # PATCH: جهّز مسارات فريدة لكل عنصر واربطها بالعنصر نفسه
+        download_plan = []
         for item in media_items:
-            path = temp_dir / _safe_filename(item['url'])
-            if path.exists():
-                if item['type'] == 'image': photos.append(path)
-                elif item['type'] in ['video', 'gif']: videos.append(path)
+            url = item.get('url')
+            if not url:
+                continue
+            target_path = _unique_media_path(temp_dir, url)
+            item['_local_path'] = target_path  # اربط المسار بالعُنصر
+            download_plan.append((url, target_path))
+
+        # نزّل بالتوازي مع retries
+        tasks = [download_media(session, url, path) for url, path in download_plan]
+        results = await asyncio.gather(*tasks)
+
+        photos, videos = [], []
+        for item, ok in zip(media_items, results):
+            if not ok:
+                continue
+            path = item['_local_path']
+            mtype = item.get('type')
+            if mtype == 'image':
+                photos.append(path)
+            elif mtype in ('video', 'gif'):
+                videos.append(path)
         
         if photos:
             photo_groups = [photos[i:i + 5] for i in range(0, len(photos), 5)]
             for i, group in enumerate(photo_groups):
-                media_group = [InputMediaPhoto(media=FSInputFile(p), caption=caption if i == 0 and j == 0 else None, parse_mode=ParseMode.MARKDOWN_V2) for j, p in enumerate(group)]
+                media_group = [
+                    InputMediaPhoto(
+                        media=FSInputFile(p),
+                        caption=caption if i == 0 else None,
+                        parse_mode=ParseMode.MARKDOWN_V2
+                    ) for p in group
+                ]
                 if not media_group: continue
                 sent_messages = await message.reply_media_group(media_group)
                 last_sent_message = sent_messages[-1]
                 if keyboard:
+                    # PATCH: ضمان ظهور الكيبورد حتى لو فشل التعديل
                     await ensure_reply_markup(bot, last_sent_message, keyboard)
         
         for video_path in videos:
+            # سنستخدم نفس caption_plain لتفادي مشاكل V2 على الفيديوهات الفردية؟ هنا نحن عبر Bot API، فيعمل V2.
+            # لكن caption من format_caption فيه تنسيق V2، استخدمه هنا.
             if video_path.stat().st_size > config.MAX_FILE_SIZE:
-                await send_large_file_pyro(video_path, caption, keyboard)
-                last_sent_message = await message.reply("✅ تم رفع الفيديو بنجاح للقناة\\.", reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN_V2)
+                caption_plain = _trim_caption(f"🐦 فيديو من تويتر: https://x.com/i/status/{tweet_id}")
+                await send_large_file_pyro(video_path, caption_plain, "MarkdownV2", keyboard)
+                last_sent_message = await message.reply("✅ تم رفع الفيديو بنجاح للقناة.", reply_markup=keyboard)
             else:
                 last_sent_message = await message.reply_video(FSInputFile(video_path), caption=caption, parse_mode=ParseMode.MARKDOWN_V2, reply_markup=keyboard)
 
@@ -345,7 +423,7 @@ async def process_single_tweet(message: Message, tweet_id: str, settings: Dict):
             await send_tweet_text_reply(message, last_sent_message, tweet_data)
 
     finally:
-        if temp_dir.exists(): shutil.rmtree(temp_dir)
+        if temp_dir.exists(): shutil.rmtree(temp_dir, ignore_errors=True)
 
 # --- Queue and Handler Logic with Fixes ---
 async def process_chat_queue(chat_id: int, bot: Bot):
@@ -356,33 +434,40 @@ async def process_chat_queue(chat_id: int, bot: Bot):
         settings = await get_user_settings(message.from_user.id)
         try:
             total = len(tweet_ids)
+            # PATCH: منع تكرار نفس النص حرفيًا + استبدال الرسالة عند "not modified"
             last_progress_text = None
             for i, tweet_id in enumerate(tweet_ids, 1):
-                # تحديث رسالة التقدم في كتلة منفصلة
-                progress_text = f"⏳ جاري معالجة الرابط *{i}* من *{total}*\\.\\.\\."
-                if progress_text != last_progress_text:
-                    try:
-                        await progress_msg.edit_text(progress_text, parse_mode=ParseMode.MARKDOWN_V2)
-                        last_progress_text = progress_text
-                    except TelegramBadRequest as e:
-                        if "message is not modified" not in (e.message or "").lower():
-                            logger.error(f"Error updating progress message: {e}")
-                
-                # معالجة التغريدة في كتلة منفصلة للإبلاغ عن الأخطاء الحقيقية
                 try:
+                    progress_text = f"⏳ جاري معالجة الرابط *{i}* من *{total}*"
+                    if progress_text != last_progress_text:
+                        try:
+                            await progress_msg.edit_text(progress_text, parse_mode=ParseMode.MARKDOWN_V2)
+                            last_progress_text = progress_text
+                        except TelegramBadRequest as e:
+                            if "message is not modified" in (e.message or "").lower():
+                                # ننشئ رسالة جديدة ونحوّل المؤشّر لها
+                                progress_msg = await message.reply(progress_text, parse_mode=ParseMode.MARKDOWN_V2)
+                                last_progress_text = progress_text
+                            else:
+                                raise
                     await process_single_tweet(message, tweet_id, settings)
-                except Exception as e:
-                    logger.exception(f"Error genuinely processing tweet {tweet_id}: {e}")
-
-            done_text = f"✅ اكتملت معالجة *{total}* روابط\\!"
+                except Exception as e: 
+                    logger.error("Error processing tweet %s: %s", tweet_id, e)
+            done_text = f"✅ اكتملت معالجة *{total}* روابط!"
             if done_text != last_progress_text:
                 try:
                     await progress_msg.edit_text(done_text, parse_mode=ParseMode.MARKDOWN_V2)
-                except TelegramBadRequest: pass
-            
-            await asyncio.sleep(5)
-            await progress_msg.delete()
-            
+                except TelegramBadRequest as e:
+                    if "message is not modified" in (e.message or "").lower():
+                        # ننشئ رسالة جديدة للإنهاء ونحوّل المؤشّر لها لمرحلة الحذف لاحقًا
+                        progress_msg = await message.reply(done_text, parse_mode=ParseMode.MARKDOWN_V2)
+                    else:
+                        raise
+            await asyncio.sleep(5); 
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
             if settings.get("delete_original"):
                 try: await message.delete()
                 except Exception: pass
@@ -394,7 +479,7 @@ async def process_chat_queue(chat_id: int, bot: Bot):
 async def handle_twitter_links(message: types.Message, bot: Bot):
     tweet_ids = await extract_tweet_ids(message.text)
     if not tweet_ids: return
-    progress_msg = await message.reply(f"تم استلام *{len(tweet_ids)}* روابط\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
+    progress_msg = await message.reply(f"تم استلام *{len(tweet_ids)}* روابط", parse_mode=ParseMode.MARKDOWN_V2)
     chat_id = message.chat.id
     if chat_id not in chat_queues: chat_queues[chat_id] = asyncio.Queue()
     await chat_queues[chat_id].put((message, tweet_ids, progress_msg))
